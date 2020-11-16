@@ -1,0 +1,799 @@
+module ocpp16;
+
+import stdio local;
+import stdlib local;
+import string local;
+import sys_time;
+import libc_time;
+import webserver;
+import events;
+import logger;
+import json;
+import file_utils;
+
+const u32 UID_SIZE=16;
+
+type Cmd enum u8 {
+    Call       = 2,
+    CallResult = 3,
+    CallError  = 4,
+}
+
+type CallType enum u8 {
+    // Client calls
+    Authorize,
+    BootNotification,
+    DiagnosticsStatusNotification,
+    FirmwareStatusNotification,
+    Heartbeat,
+    MeterValues,
+    StartTransaction,
+    StopTransaction,
+    // Server calls
+    ChangeAvailability,
+    ChangeConfiguration,
+    ClearCache,
+    GetCompositeSchedule,
+    GetConfiguration,
+    GetDiagnostics,
+    GetLocalListVersion,
+    RemoteStartTransaction,
+    RemoteStopTransaction,
+    Reset,
+    SetChargingProfile,
+    SendLocalList,
+    TriggerMessage,
+    UnlockConnector,
+    UpdateFirmware,
+}
+
+func const char* get_utc_time(i32 offset) {
+    sys_time.Timeval tv;
+    sys_time.gettimeofday(&tv, nil);
+    tv.tv_sec += offset;
+    libc_time.Tm tm = { 0 }
+    libc_time.gmtime_r(&tv.tv_sec, &tm);
+    local char[40] result;
+    result[0] = 0;
+    libc_time.strftime(result, sizeof(result), "%FT%TZ", &tm);
+    return result;
+}
+
+func const char* call2str(CallType c) {
+    switch (c) {
+    // Client calls
+    case CallType.Authorize:                return "Authorize";
+    case CallType.BootNotification:         return "BootNotification";
+    case CallType.Heartbeat:                return "Heartbeat";
+    case CallType.DiagnosticsStatusNotification: return "DiagnosticsStatusNotification";
+    case CallType.FirmwareStatusNotification: return "FirmwareStatusNotification";
+    case CallType.MeterValues:              return "MeterValues";
+    case CallType.StartTransaction:         return "StartTransaction";
+    case CallType.StopTransaction:          return "StopTransaction";
+    // server calls
+    case CallType.ChangeAvailability:       return "ChangeAvailability";
+    case CallType.ChangeConfiguration:      return "ChangeConfiguration";
+    case CallType.ClearCache:               return "ClearCache";
+    case CallType.GetCompositeSchedule:     return "GetCompositeSchedule";
+    case CallType.GetConfiguration:         return "GetConfiguration";
+    case CallType.GetDiagnostics:           return "GetDiagnostics";
+    case CallType.GetLocalListVersion:      return "GetLocalListVersion";
+    case CallType.RemoteStartTransaction:   return "RemoteStartTransaction";
+    case CallType.RemoteStopTransaction:    return "RemoteStopTransaction";
+    case CallType.Reset:                    return "Reset";
+    case CallType.SetChargingProfile:       return "SetChargingProfile";
+    case CallType.SendLocalList:            return "SendLocalList";
+    case CallType.TriggerMessage:           return "TriggerMessage";
+    case CallType.UnlockConnector:          return "UnlockConnector";
+    case CallType.UpdateFirmware:           return "UpdateFirmware";
+    }
+    return "";
+}
+
+public type Server struct {
+    webserver.Session* session;
+    events.Base* base;
+    events.Timer reply_timer;
+    bool has_reply;
+    char[33] last_msg_id;
+    CallType last_call;
+    logger.Log log;
+    json.Builder builder;
+    json.Parser parser;
+
+    char[512] url;
+    char[UID_SIZE] uuid;
+    u32 last_transaction;
+
+    bool reject_bootnotification;
+    bool[3] port_operative;
+    u32 selected_port;
+    u32 heartbeat_interval;
+    i32 list_version;
+} @(opaque)
+
+
+public func Server* Server.create(webserver.Session* session,
+                                  events.Base* base,
+                                  logger.Base* logbase,
+                                  const char* url)
+{
+    Server* s = calloc(1, sizeof(Server));
+    s.session = session;
+    s.base = base;
+    strcpy(s.url, url); // TODO check size limit
+    s.log.init(logbase, "ocpp");
+    s.log.setLevel(logger.Level.Info);
+    s.log.setLevel(logger.Level.Debug);
+    s.log.info("started for %s", s.url);
+    s.builder.init(4096);
+    s.parser.init();
+    s.reply_timer.assign(base, 0, on_reply_timeout, s);
+    s.last_transaction = 1000;
+    //s.reject_bootnotification = true;
+    s.reject_bootnotification = false;
+    s.selected_port = 1;
+    for (u32 i=0; i<elemsof(s.port_operative); i++) s.port_operative[i] = true;
+    return s;
+}
+
+public func void Server.destroy(Server* s) {
+    s.log.info("closing %s", s.url);
+    s.reply_timer.del();
+    s.parser.destroy();
+    s.builder.free();
+    free(s);
+}
+
+func void on_reply_timeout(void* arg) {
+    Server* s = cast<Server*>(arg);
+    s.log.warn("timeout on reply");
+}
+
+public func void Server.recv(Server* s, const char* data, u32 len) {
+    s.log.debug("recv: [%u] %s", len, data);
+
+    if (!s.parser.parse(data)) {
+        s.log.warn("invalid json: %s", s.parser.getDiag());
+        s.session.close();
+        return;
+    }
+    json.Iter iter = s.parser.getArrayIter(nil);
+    if (!iter.check_schema("ss.")) {
+        s.log.warn("invalid schema");
+        s.session.close();
+        return;
+    }
+
+    i32 id = atoi(iter.getValue());
+    iter.next();
+    const char* msg_id = iter.getValue();
+    iter.next();
+
+    switch (id) {
+    case Cmd.Call:
+        if (!s.handle_call(&iter, msg_id)) {
+            s.log.warn("invalid call");
+            s.session.close();
+        }
+        break;
+    case Cmd.CallResult:
+        s.handle_call_result(&iter, msg_id);
+        break;
+    case Cmd.CallError:
+        s.handle_call_error(&iter, msg_id);
+        break;
+    default:
+        s.log.warn("unknown command");
+        s.session.close();
+        break;
+    }
+}
+
+func void Server.start_reply(Server* s, const char* msg_id) {
+    s.builder.reset();
+    s.builder.addArray(nil);
+    s.builder.addNumber(nil, Cmd.CallResult);
+    s.builder.addValue(nil, msg_id);
+    s.builder.addObject(nil);
+}
+
+func void Server.start_call(Server* s, const char* msg_id, CallType call) {
+    s.builder.reset();
+    s.builder.addArray(nil);
+    s.builder.addNumber(nil, Cmd.Call);
+    s.builder.addValue(nil, msg_id);
+    s.builder.addValue(nil, call2str(call));
+    s.builder.addObject(nil);
+    s.has_reply = true;
+    strncpy(s.last_msg_id, msg_id, sizeof(s.last_msg_id));
+    s.last_msg_id[sizeof(s.last_msg_id)-1] = 0;
+    s.last_call = call;
+}
+func void Server.finish_and_send_msg(Server* s) {
+    s.builder.closeObject();
+    s.builder.closeArray();
+    s.send();
+    if (s.has_reply) s.reply_timer.add(events.sec(8));
+}
+
+func bool Server.handle_call(Server* s, json.Iter* iter, const char* msg_id) {
+    if (!iter.check_schema("so")) return false;
+    const char* call = iter.getValue();
+    iter.next();
+    sswitch (call) {
+    case "Authorize":
+        const char* idtag = iter.find_text("idTag");
+        if (!idtag) return false;
+        bool authorized = false;
+        // Hardcoded key tag
+        if (strcmp(idtag, "043ba1b24d5380") == 0) authorized = true;
+
+        s.log.info("authorization of tag %s: %s", idtag, authorized ? "authorized" : "rejected");
+        s.start_reply(msg_id);
+        s.builder.addObject("idTagInfo");
+        s.builder.addValue("status", authorized ? "Accepted" : "Invalid");
+        s.builder.closeObject();
+        s.finish_and_send_msg();
+    case "BootNotification":
+        const char* vendor = iter.find_text("chargePointVendor");
+        const char* model = iter.find_text("chargePointModel");
+        const char* serial = iter.find_text("chargePointSerialNumber");
+        const char* fwversion  = iter.find_text("firmwareVersion");
+        if (!model || !vendor) {
+            s.log.warn("invalid BootNotification msg");
+            return false;
+        }
+        const char* iccid  = iter.find_text("iccid");
+        const char* imsi  = iter.find_text("imsi");
+        s.log.info("recv BootNotification (%s, %s, %s, %s, %s, %s)", vendor, model, serial, fwversion, iccid, imsi);
+
+        s.start_reply(msg_id);
+        if (s.reject_bootnotification) {
+            s.builder.addValue("status", "Rejected");
+            s.builder.addValue("currentTime", get_utc_time(0));
+            s.builder.addNumber("interval", 8);
+        } else {
+            s.builder.addValue("status", "Accepted");
+            s.builder.addValue("currentTime", get_utc_time(0));
+            s.builder.addNumber("interval", 900);
+        }
+        s.finish_and_send_msg();
+    case "FirmwareStatusNotification":
+        const char* status = iter.find_text("status");
+        if (!status) {
+            s.log.warn("invalid FirmwareStatusNotification");
+            return false;
+        }
+        s.log.info("recv FirmwareStatusNotification (%s)", status);
+        s.start_reply(msg_id);
+        s.finish_and_send_msg();
+    case "DiagnosticsStatusNotification":
+        const char* status = iter.find_text("status");
+        if (!status) {
+            s.log.warn("invalid DiagnosticsStatusNotification");
+            return false;
+        }
+        s.log.info("recv DiagnosticsStatusNotification (%s)", status);
+        s.start_reply(msg_id);
+        s.finish_and_send_msg();
+    case "Heartbeat":
+        s.log.info("recv Heartbeat");
+        s.start_reply(msg_id);
+        s.builder.addValue("currentTime", get_utc_time(0));
+        s.finish_and_send_msg();
+    case "MeterValues":
+        const char* conn_id = iter.find_text("connectorId");
+        if (!conn_id) {
+            s.log.warn("invalid MeterValues msg");
+            return false;
+        }
+        // TODO parse meter values (need Iter.getArray()  function)
+        s.log.info("recw MeterValues conn %s", conn_id);
+        s.start_reply(msg_id);
+        s.finish_and_send_msg();
+    case "StartTransaction":
+        const char* conn_id = iter.find_text("connectorId");
+        const char* id_tag = iter.find_text("idTag");
+        const char* meter_start = iter.find_text("meterStart");
+        const char* timestamp = iter.find_text("timestamp");
+        if (!conn_id || !id_tag || !meter_start || !timestamp) {
+            s.log.warn("invalid StartTransaction msg");
+            return false;
+        }
+        s.log.info("recv StartTransaction (%s, %s, %s, %s)", conn_id, id_tag, meter_start, timestamp);
+        //s.log.warn("NOT SENDING StartTransaction reply for testing");
+        s.start_reply(msg_id);
+        s.builder.addObject("idTagInfo");
+        // s.builder.addValue("expiryDate", get_utc_time(100));    // optional
+        // Note: skip optional parentIdTag
+        // Note: status can be: "Accepted", "Blocked", "Expired", "Invalid", "ConcurrentTx"
+        s.builder.addValue("status", "Accepted");
+        s.builder.closeObject();
+        s.last_transaction++;
+        s.builder.addNumber("transactionId", s.last_transaction);
+        s.finish_and_send_msg();
+    case "StatusNotification":
+        const char* conn_id = iter.find_text("connectorId");
+        const char* error_code = iter.find_text("errorCode");
+        const char* status = iter.find_text("status");      // optional
+        const char* info = iter.find_text("info");
+        if (!conn_id || !error_code || !status) {
+            s.log.warn("invalid StatusNotification msg");
+            return false;
+        }
+        s.log.info("recv StatusNotification (%s, %s, %s, '%s')", conn_id, status, error_code, info ? info : "");
+        s.start_reply(msg_id);
+        s.finish_and_send_msg();
+    case "StopTransaction":
+        const char* trans_id = iter.find_text("transactionId");
+        const char* meter_stop = iter.find_text("meterStop");
+        const char* timestamp = iter.find_text("timestamp");
+        const char* id_tag = iter.find_text("idTag");   // optional
+        const char* reason = iter.find_text("reason");  // optional
+        if (!trans_id || !meter_stop || !timestamp) {
+            s.log.warn("invalid StopTransaction msg");
+            return false;
+        }
+        s.log.info("recv StopTransaction (%s, %s, %s, '%s', '%s')", trans_id, meter_stop, timestamp, id_tag ? id_tag : "", reason ? reason : nil);
+        s.start_reply(msg_id);
+        s.builder.addObject("idTagInfo");
+        s.builder.addValue("status", "Accepted");
+        s.builder.closeObject();
+        s.finish_and_send_msg();
+    case "DataTransferRequest":
+        const char* vendorId = iter.find_text("vendorId");
+        if (!vendorId) {
+            s.log.warn("invalid DataTransferRequest");
+            return false;
+        }
+        const char* msgId = iter.find_text("messageId");
+        s.log.info("DataTransferRequest: vendor: %s  message: %s", vendorId, msgId ? msgId : "-");
+        s.start_reply(msg_id);
+        s.builder.addValue("status", "Accepted");
+        s.finish_and_send_msg();
+    default:
+        s.log.warn("unknown call %s", call);
+    }
+    return true;
+}
+
+func void Server.handle_result_get_comp_sched(Server* s, json.Iter* iter) {
+    const char* status = iter.find_text("status");
+    if (!status) {
+        s.log.warn("missing status in reply for GetCompositeSchedule");
+        return;
+    }
+    sswitch (status) {
+    case "Accepted":
+        // ok
+    case "Rejected":
+        s.log.warn("GetCompositeSchedule was rejected");
+        return;
+    default:
+        s.log.warn("missing status in reply for GetCompositeSchedule");
+        return;
+    }
+    //const char* conn_str = iter.find_text("status");
+    // TODO print schedule (need better JSON iterators)
+}
+
+func void Server.handle_call_result(Server* s, json.Iter* iter, const char* msg_id) {
+    if (strcmp(msg_id, s.last_msg_id) != 0) {
+        s.log.warn("reply msg-id doesn't match (expect %s, got %s)", s.last_msg_id, msg_id);
+        return;
+    }
+    s.last_msg_id[0] = 0;
+    s.has_reply = false;
+    s.reply_timer.del();
+
+    switch (s.last_call) {
+    // Client calls
+    case CallType.Authorize:                        fallthrough;
+    case CallType.BootNotification:                 fallthrough;
+    case CallType.Heartbeat:                        fallthrough;
+    case CallType.DiagnosticsStatusNotification:    fallthrough;
+    case CallType.FirmwareStatusNotification:       fallthrough;
+    case CallType.MeterValues:                      fallthrough;
+    case CallType.StartTransaction:                 fallthrough;
+    case CallType.StopTransaction:
+        // should not happen
+        return;
+    // server calls
+    case CallType.ChangeAvailability:               fallthrough;
+    case CallType.ChangeConfiguration:              fallthrough;
+    case CallType.ClearCache:
+        break;
+    case CallType.GetCompositeSchedule:
+        s.handle_result_get_comp_sched(iter);
+        return;
+    case CallType.GetConfiguration:
+        // TODO print
+        break;
+    case CallType.GetDiagnostics:                   fallthrough;
+    case CallType.GetLocalListVersion:              fallthrough;
+    case CallType.RemoteStartTransaction:           fallthrough;
+    case CallType.RemoteStopTransaction:            fallthrough;
+    case CallType.Reset:                            fallthrough;
+    case CallType.SetChargingProfile:               fallthrough;
+    case CallType.SendLocalList:                    fallthrough;
+    case CallType.TriggerMessage:                   fallthrough;
+    case CallType.UnlockConnector:                  fallthrough;
+    case CallType.UpdateFirmware:
+        break;
+    }
+    s.log.warn("TODO handle call result");
+
+}
+
+func void Server.handle_call_error(Server* s, json.Iter* iter, const char* msg_id) {
+    s.reply_timer.del();
+    if (!iter.check_schema("sso")) {
+        s.log.warn("invalid schema");
+        s.session.close();
+        return;
+    }
+    const char* errorCode = iter.getValue();
+    iter.next();
+    const char* errorDescr = iter.getValue();
+    iter.next();
+    s.log.warn("callError: %s  (%s)", errorCode, errorDescr);
+}
+
+func void Server.send(Server* s) {
+    s.log.debug("send: %s", s.builder.getData());
+    s.session.write(s.builder.getData(), s.builder.getSize());
+}
+
+func const char* uuid2str(const char* uuid, u32 len) {
+    local char[4][40] buffer;
+    local i32 index = 0;
+    index++;
+    if (index == 4) index = 0;
+    char* cp = buffer[index];
+    *cp = 0;
+    for (u32 i=0; i<len; i++) cp += sprintf(cp, "%02X", cast<u8>(uuid[i]));
+
+    return buffer[index];
+}
+
+func const char* Server.get_next_uuid(Server* s) {
+    u32 pos = sizeof(s.uuid) - 1;
+    while (1) {
+        s.uuid[pos]++;
+        if (s.uuid[pos] != 0) break;
+        pos--;
+    }
+    return uuid2str(s.uuid, sizeof(s.uuid));
+}
+
+public func void Server.handle_key(Server* s, char key) {
+    switch (key) {
+    case '?':
+        printf("OCPP commands:\n");
+        printf("   +/-    increase/decrease log level\n");
+        printf("   0-2    select port\n");
+        printf("   5-9    send json command from file (cmdX.json)\n");
+        printf("   a      change availability (selected port)\n");
+        printf("   b      send big msg (> 8Kb)\n");
+        printf("   c      get configuration\n");
+        printf("   d      send double calls (2x status)\n");
+        printf("   e      send trigger message (MeterValues)\n");
+        printf("   f      send firmware update\n");
+        printf("   g      get diagnostics of last hour\n");
+        printf("   G      get all diagnostics\n");
+        printf("   H      change heartbeat interval\n");
+        printf("   j      set Charging Profile CP_MAX daily\n");
+        printf("   k      set Charging Profile TX_DEFAULT daily 10A (selected port)\n");
+        printf("   l      send local-list\n");
+        printf("   m      send trigger message (for StatusNotification)\n");
+        printf("   o      get composite charging schedule (week)\n");
+        printf("   r      soft-reset\n");
+        printf("   R      hard-reset\n");
+        printf("   s      remote start transaction\n");
+        printf("   S      remote stop transaction\n");
+        printf("   t      send trigger mesage (for BootNotification)\n");
+        printf("   u      unlock connector (port 1))\n");
+        printf("   v      get local-list version\n");
+        printf("   w      clear cache\n");
+        printf("   x      set Charging Profile TX_DEFAULT RELATIVE (selected port)\n");
+        printf("   z      set MeterValue interval to 60\n");
+        break;
+    case '+':
+        if (s.log.level != logger.Level.Debug) {
+            s.log.info("increase loglevel");
+            s.log.setLevel(logger.Level.Debug);
+        }
+        break;
+    case '-':
+        if (s.log.level != logger.Level.Info) {
+            s.log.info("decrease loglevel");
+            s.log.setLevel(logger.Level.Info);
+        }
+        break;
+    case '0':   fallthrough;
+    case '1':   fallthrough;
+    case '2':
+        s.selected_port = cast<u32>(key - '0');
+        s.log.info("selecting port %d", s.selected_port);
+        break;
+    case '5':   fallthrough;
+    case '6':   fallthrough;
+    case '7':   fallthrough;
+    case '8':   fallthrough;
+    case '9':
+        char[16] filename;
+        sprintf(filename, "cmd%u.json", key - '0');
+        s.log.info("sending json from file (%s)", filename);
+        file_utils.Reader file;
+        u64 modtime =0;
+        if (!file.open(filename, nil)) {
+            s.log.error("cannot open %s: %s", filename, strerror(file.errno));
+            return;
+        }
+        if (!file.map()) return;
+        char* data = cast<char*>(file.data());
+        s.log.debug("send: %s", data);
+        u32 len = cast<u32>(strlen(data));
+        if (data[len-1] == '\n') len--; // strip newline
+        s.session.write(data, len);
+        file.close();
+        break;
+    case 'a':
+        u32 id = s.selected_port;
+        const char* avail = "Operative";
+        s.port_operative[id] = !s.port_operative[id];
+        if (!s.port_operative[id]) avail = "Inoperative";
+        s.log.info("setting port%d to %s", id, avail);
+        s.start_call(s.get_next_uuid(), CallType.ChangeAvailability);
+        s.builder.addNumber("connectorId", id);
+        s.builder.addValue("type", avail);
+        s.finish_and_send_msg();
+        break;
+    case 'b':
+        char[18*1024] big;
+        s.log.info("sending (too) big frame (%u bytes)", sizeof(big));
+        memset(big, 'a', sizeof(big));
+        big[sizeof(big)-1] = 0;
+        s.session.write(big, sizeof(big));
+        break;
+    case 'c':       // get configuration
+        s.start_call(s.get_next_uuid(), CallType.GetConfiguration);
+        s.finish_and_send_msg();
+        break;
+    case 'd':
+        s.start_call(s.get_next_uuid(), CallType.TriggerMessage);
+        s.builder.addValue("requestedMessage", "StatusNotification");
+        s.finish_and_send_msg();
+
+        s.start_call(s.get_next_uuid(), CallType.TriggerMessage);
+        s.builder.addValue("requestedMessage", "MeterValues");
+        s.finish_and_send_msg();
+        break;
+    case 'e':
+        s.start_call(s.get_next_uuid(), CallType.TriggerMessage);
+        s.builder.addValue("requestedMessage", "MeterValues");
+        s.finish_and_send_msg();
+        break;
+    case 'f':
+        s.log.info("sending firmware update");
+        s.start_call(s.get_next_uuid(), CallType.UpdateFirmware);
+        // TODO fill in own ipnr
+        s.builder.addValue("location", "192.168.4.109:8080/files/update.swu");
+        s.builder.addValue("retrieveDate", get_utc_time(2));   // 2 seconds in the future
+        s.finish_and_send_msg();
+        break;
+    case 'g':
+        s.log.info("getting diagnostics of last hour");
+        s.start_call(s.get_next_uuid(), CallType.GetDiagnostics);
+        s.builder.addValue("location", "ftp://192.168.4.160:21/Diagnostics");
+        s.builder.addNumber("retries", 10);
+        s.builder.addNumber("retryInterval", 8);
+        s.builder.addValue("startTime", get_utc_time(-60*60));
+        s.builder.addValue("stopTime", get_utc_time(0));
+        s.finish_and_send_msg();
+        break;
+    case 'G':
+        s.log.info("getting all diagnostics");
+        s.start_call(s.get_next_uuid(), CallType.GetDiagnostics);
+        s.builder.addValue("location", "ftp://192.168.4.160:21/Diagnostics");
+        s.finish_and_send_msg();
+        break;
+    case 'H':
+        if (s.heartbeat_interval == 10) s.heartbeat_interval = 4;
+        else s.heartbeat_interval = 10;
+        s.log.info("setting heartbeat interval to %u", s.heartbeat_interval);
+        s.start_call(s.get_next_uuid(), CallType.ChangeConfiguration);
+        s.builder.addValue("key", "HeartbeatInterval");
+        char[16] value_str;
+        sprintf(value_str, "%u", s.heartbeat_interval);
+        s.builder.addValue("value", value_str);
+        s.finish_and_send_msg();
+        break;
+    case 'j':
+        s.log.info("sending daily CP_MAX profile");
+        s.start_call(s.get_next_uuid(), CallType.SetChargingProfile);
+        s.builder.addNumber("connectorId", 0);
+        s.builder.addObject("csChargingProfiles");
+        s.builder.addNumber("chargingProfileId", 123);
+        s.builder.addNumber("stackLevel", 3);
+        s.builder.addValue("chargingProfilePurpose", "ChargePointMaxProfile");
+        s.builder.addValue("chargingProfileKind", "Recurring");
+        s.builder.addValue("recurrencyKind", "Daily");
+        s.builder.addValue("validFrom", "2018-06-26T00:00:00Z");
+        s.builder.addValue("validTo", "2028-10-26T00:00:00Z");
+        s.builder.addObject("chargingSchedule");
+        s.builder.addValue("startSchedule", "2018-06-26T00:00:00Z");
+        s.builder.addNumber("duration", 86400);
+        s.builder.addValue("chargingRateUnit", "A");
+        s.builder.addArray("chargingSchedulePeriod");
+        const u32[] starts = { 0, 28800, 72000 }
+        const char*[] limits = { "60.2", "40.3", "50.7" }
+        for (u32 i=0; i<elemsof(starts); i++) {
+            s.builder.addObject(nil);
+            s.builder.addNumber("startPeriod", starts[i]);
+            s.builder.addValue("limit", limits[i]);
+            // skip numberPhases
+            s.builder.closeObject();
+        }
+        s.builder.closeArray();
+        s.builder.closeObject();
+        s.builder.closeObject();
+        s.finish_and_send_msg();
+        break;
+    case 'k':
+        s.log.info("sending daily TX_DEFAULT profile (port %u)", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.SetChargingProfile);
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.builder.addObject("csChargingProfiles");
+        s.builder.addNumber("chargingProfileId", 456);
+        s.builder.addNumber("stackLevel", 3);
+        s.builder.addValue("chargingProfilePurpose", "TxDefaultProfile");
+        s.builder.addValue("chargingProfileKind", "Recurring");
+        s.builder.addValue("recurrencyKind", "Daily");
+        s.builder.addValue("validFrom", "2018-06-26T00:00:00Z");
+        s.builder.addValue("validTo", "2028-10-26T00:00:00Z");
+        s.builder.addObject("chargingSchedule");
+        s.builder.addValue("startSchedule", "2018-06-26T00:00:00Z");
+        s.builder.addNumber("duration", 86400);
+        s.builder.addValue("chargingRateUnit", "A");
+        s.builder.addArray("chargingSchedulePeriod");
+        {
+            s.builder.addObject(nil);
+            s.builder.addNumber("startPeriod", 0);
+            s.builder.addValue("limit", "10.0");
+            // skip numberPhases
+            s.builder.closeObject();
+        }
+        s.builder.closeArray();
+        s.builder.closeObject();
+        s.builder.closeObject();
+        s.finish_and_send_msg();
+        break;
+    case 'l':
+        s.list_version++;
+        s.log.info("sending local list (version %d)", s.list_version);
+        s.start_call(s.get_next_uuid(), CallType.SendLocalList);
+        s.builder.addNumber("listVersion", s.list_version);
+        s.builder.addValue("updateType", "Full");   // can also be 'Differential'
+        s.builder.addArray("localAuthorizationList");
+        while (1) {
+            s.builder.addObject(nil);
+            s.builder.addValue("idTag", "0413a2b24d5380");  // NOTE: hardcoded 2nd tag
+            s.builder.addObject("idTagInfo");
+            s.builder.addValue("expiryDate", get_utc_time(120));    // 120 seconds into future
+            // Note: dont use parentIdTag
+            // Note: status can be: "Accepted", "Blocked", "Expired", "Invalid", "ConcurrentTx"
+            s.builder.addValue("status", "Accepted");
+            s.builder.closeObject();
+            s.builder.closeObject();
+            break;
+        }
+        s.builder.closeArray();
+        s.finish_and_send_msg();
+        break;
+    case 'm':
+        s.log.info("request StatusNotification (port %u)", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.TriggerMessage);
+        s.builder.addValue("requestedMessage", "StatusNotification");
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.finish_and_send_msg();
+        break;
+    case 'o':
+        s.log.info("request GetCompositeSchedule (port %u)", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.GetCompositeSchedule);
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.builder.addNumber("duration", 7*86400);
+        s.builder.addValue("chargingRateUnit", "A");
+        s.finish_and_send_msg();
+        break;
+    case 'r':
+        s.log.info("requesting soft reset");
+        s.start_call(s.get_next_uuid(), CallType.Reset);
+        s.builder.addValue("type", "Soft");
+        s.finish_and_send_msg();
+        break;
+    case 'R':
+        s.log.info("requesting hard reset");
+        s.start_call(s.get_next_uuid(), CallType.Reset);
+        s.builder.addValue("type", "Hard");
+        s.finish_and_send_msg();
+        break;
+    case 's':
+        s.log.info("remote start transaction (port %u)", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.RemoteStartTransaction);
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.builder.addValue("idTag", "043ba1b24d5380");      // authorized card
+        // Note: skip optional chargingProfile
+        s.finish_and_send_msg();
+        break;
+    case 'S':
+        s.log.info("remote stop transaction");
+        s.start_call(s.get_next_uuid(), CallType.RemoteStopTransaction);
+        s.builder.addNumber("transactionId", s.last_transaction);
+        s.finish_and_send_msg();
+        break;
+    case 't':
+        s.log.info("sending trigger message (port %u)", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.TriggerMessage);
+        s.builder.addValue("requestedMessage", "BootNotification");
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.finish_and_send_msg();
+        break;
+    case 'u':
+        s.log.info("requesting connector unlock (port %u)");
+        s.start_call(s.get_next_uuid(), CallType.UnlockConnector);
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.finish_and_send_msg();
+        break;
+    case 'v':
+        s.log.info("requesting local-list version");
+        s.start_call(s.get_next_uuid(), CallType.GetLocalListVersion);
+        s.finish_and_send_msg();
+        break;
+    case 'w':
+        s.log.info("requesting cache clear");
+        s.start_call(s.get_next_uuid(), CallType.ClearCache);
+        s.finish_and_send_msg();
+        break;
+    case 'x':
+        s.log.info("sending relative TX_DEFAULT profile (port %u)", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.SetChargingProfile);
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.builder.addObject("csChargingProfiles");
+        s.builder.addNumber("chargingProfileId", 123);
+        s.builder.addNumber("stackLevel", 5);
+        s.builder.addValue("chargingProfilePurpose", "TxDefaultProfile");
+        s.builder.addValue("chargingProfileKind", "Relative");
+        //s.builder.addValue("recurrencyKind", "None");
+        s.builder.addValue("validFrom", "2018-06-26T00:00:00Z");
+        s.builder.addValue("validTo", "2028-10-26T00:00:00Z");
+        s.builder.addObject("chargingSchedule");
+        //s.builder.addValue("startSchedule", "2018-06-26T00:00:00Z");
+        s.builder.addNumber("duration", 180);
+        s.builder.addValue("chargingRateUnit", "A");
+        s.builder.addArray("chargingSchedulePeriod");
+        const u32[] starts = { 0, 60, 120 }
+        const char*[] limits = { "16.0", "10.0", "8.0" }
+        for (u32 i=0; i<elemsof(starts); i++) {
+            s.builder.addObject(nil);
+            s.builder.addNumber("startPeriod", starts[i]);
+            s.builder.addValue("limit", limits[i]);
+            // skip numberPhases
+            s.builder.closeObject();
+        }
+        s.builder.closeArray();
+        s.builder.closeObject();
+        s.builder.closeObject();
+        s.finish_and_send_msg();
+        break;
+    case 'z':
+        s.log.info("setting metervalues interval to 60 seconds");
+        s.start_call(s.get_next_uuid(), CallType.ChangeConfiguration);
+        s.builder.addValue("key", "MeterValueSampleInterval");
+        s.builder.addNumber("value", 60);
+        s.finish_and_send_msg();
+        break;
+    }
+}
+

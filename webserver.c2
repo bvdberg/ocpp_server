@@ -1,0 +1,225 @@
+module webserver;
+
+import stdlib local;
+import string local;
+#ifdef DEBUG_HTTP
+import stdio local;
+import color;
+#endif
+
+import logger;
+import events;
+import tcp_server;
+import linked_list;
+import http;
+import websockets;
+
+public type Session struct {
+    Server* server;
+    tcp_server.Connection* conn;
+
+    // NOTE only one handler is active at a time
+    http.Handler* http_handler;
+    websockets.Handler* ws_handler; // NOTE: nil at first
+    Protocol* protocol;
+    void* user;    // set by user
+    char[16] src_ip;
+    linked_list.Element list;
+    u32 id;
+} @(opaque)
+
+public func void Session.set_user(Session* session, void* user) {
+    session.user = user;
+}
+
+public func void* Session.get_user(const Session* session) {
+    return session.user;
+}
+
+public func void* Session.get_arg(const Session* session) {
+    return session.protocol.arg;
+}
+
+public func void Session.write(Session* s, const char* data, u32 len) {
+    s.ws_handler.write(data, len);
+}
+
+public func void Session.close(Session* s) {
+    s.destroy();
+}
+
+
+func void on_ws_send(void* arg, const u8* data, u32 len) {
+    Session* s = cast<Session*>(arg);
+    if (s.conn) s.conn.write(cast<const char*>(data), len);
+}
+
+func void on_ws_recv(void* arg, const u8* data, u32 len) {
+    Session* s = cast<Session*>(arg);
+    s.protocol.on_data(s, data, len);
+}
+
+func void on_ws_close(void* arg) {
+    Session* s = cast<Session*>(arg);
+    s.server.log.info("connection closed by protocol");
+    s.destroy();
+}
+
+public type WsOnMatch func const char* (Session* session, const char** protos, u32 num_protos);
+public type WsOnOpen func void (Session* session, const char* url, const char* proto);
+public type WsOnClose func void (Session* session);
+public type WsOnData func void (webserver.Session* session, const u8* data, u32 len);
+public type Protocol struct {
+    WsOnMatch on_match;
+    WsOnOpen on_open;
+    WsOnClose on_close;
+    WsOnData on_data;
+    void* arg;
+}
+
+func Session* Session.create(Server* server,
+                             tcp_server.Connection* c,
+                             http.Backend* backend,
+                             Protocol* protocol,
+                             u32 id,
+                             const char* src_ip)
+{
+    Session* s = calloc(1, sizeof(Session));
+    s.conn = c;
+    s.server = server;
+    s.protocol = protocol;
+    strcpy(s.src_ip, src_ip);
+    s.id = id;
+
+    // set http as first protocol handler
+    http.Conn http_cb;
+    http_cb.send = on_http_send;
+    http_cb.sendFile = on_http_send_file;
+    http_cb.close = on_http_close;
+    http_cb.error = on_http_error;
+    http_cb.match = on_http_match;
+    http_cb.upgrade = on_http_upgrade;
+    http_cb.arg = s;
+
+    s.http_handler = http.Handler.create(&http_cb, backend, s.src_ip, server.log);
+    return s;
+}
+
+func void Session.destroy(Session* s) {
+    s.server.log.info("closing connection");
+    if (s.http_handler) s.http_handler.destroy();
+    if (s.ws_handler) {
+        s.protocol.on_close(s);
+        s.ws_handler.destroy();
+    }
+    s.list.remove();
+    if (s.conn) s.conn.close();
+    free(s);
+}
+
+func void on_http_send(void* arg, const char* data, u32 len) {
+    Session* s = cast<Session*>(arg);
+#ifdef DEBUG_HTTP
+    printf("%s------\n%s\n------%s\n", color.Red, data, color.Normal);
+#endif
+    if (s.conn) s.conn.write(data, len);
+}
+
+func void on_http_send_file(void* arg, i32 fd, u64 len) {
+    Session* s = cast<Session*>(arg);
+    if (s.conn) s.conn.send_file(fd, len);
+}
+
+func void on_http_close(void* arg) {
+    Session* s = cast<Session*>(arg);
+    s.destroy();
+}
+
+func void on_http_error(void* arg, char* msg) {
+    Session* s = cast<Session*>(arg);
+    s.server.log.warn("HTTP error %s", msg);
+    s.destroy();
+}
+
+func const char* on_http_match(void* arg, const char** protos, u32 proto_count) {
+    Session* s = cast<Session*>(arg);
+    return s.protocol.on_match(s, protos, proto_count);
+}
+
+func void on_http_upgrade(void* arg, const char* url, const char* proto) {
+    Session* s = cast<Session*>(arg);
+    s.server.log.debug("upgrade connection to %s", proto);
+    s.ws_handler = websockets.Handler.create(true, on_ws_send, on_ws_recv, on_ws_close, s, s.server.log);
+    s.protocol.on_open(s, url, proto);
+    s.http_handler.destroy();
+    s.http_handler = nil;
+}
+
+func void on_connection_lost(void* arg) {
+    Session* s = arg;
+    s.conn = nil;
+    s.server.log.info("connection lost");
+    s.destroy();
+}
+
+func void on_connection_data(void* arg, const char* data, u32 len) {
+    Session* s = arg;
+    if (s.ws_handler) {
+        s.ws_handler.on_data(cast<u8*>(data), len);
+    } else if (s.http_handler) {
+#ifdef DEBUG_HTTP
+        printf("%s------\n%s\n------%s\n", color.Green, data, color.Normal);
+#endif
+        s.http_handler.parse(data, len);
+    }
+}
+
+public type Server struct {
+    events.Base* base;
+    logger.Log* log;
+    http.Backend* backend;
+    Protocol protocol;
+    tcp_server.Socket* socket;
+    linked_list.Element sessions;
+    u32 conn_id;
+} @(opaque)
+
+public func Server* create(events.Base* base,
+                           http.Backend* backend,
+                           const Protocol* protocol,
+                           logger.Log* log,
+                           u16 port)
+{
+    Server* s = calloc(1, sizeof(Server));
+    s.base = base;
+    s.backend = backend;
+    s.protocol = *protocol;
+    s.log = log;
+    s.sessions.init();
+
+    s.socket = tcp_server.Socket.create(base, port, handleNewConnection, s);
+    s.log.info("listening on port %u", port);
+
+    return s;
+}
+
+public func void Server.destroy(Server* s) {
+    s.log.info("closing");
+    linked_list.Element* node = s.sessions.next;
+    while (node != &s.sessions) {
+        Session* session = to_container(Session, list, node);
+        node = node.next;
+        session.destroy();
+    }
+    free(s);
+}
+
+func void handleNewConnection(tcp_server.Connection* c, void* arg, const char* src_ip) {
+    Server* s = arg;
+    s.conn_id++;
+    s.log.info("new connection from %s", src_ip);
+    Session* session = Session.create(s, c, s.backend, &s.protocol, s.conn_id, src_ip);
+    s.sessions.addTail(&session.list);
+    c.setHandlers(on_connection_lost, on_connection_data, session);
+}
+

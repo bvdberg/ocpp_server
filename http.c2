@@ -1,0 +1,903 @@
+module http;
+
+import stdlib local;
+import stdio local;
+import string local;
+import stdarg local;
+import csetjmp local;
+import libc_time local;
+import utils;
+import logger;
+import sha1;
+import base64;
+
+const char[] WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const u8 MAX_WS_PROTOS = 4;
+const u8 MAX_WS_PROTO_LEN = 16;
+
+public type Status enum u8 {
+    Ok200 = 0,
+    Created201,
+    SwitchingProtocols101,
+    BadRequest400,
+    Forbidden403,
+    NotFound404,
+    UnsupportedMediatype415,
+    NotImplementd501,
+    VersionNotSupported505,
+}
+
+type Method enum u8 {
+    Invalid = 0,
+    Options,
+    Get,
+    Head,
+    Post,
+    Put,
+    Delete,
+    Trace,
+    Connect,
+}
+
+type Token enum u8 {
+    Space,
+    Newline,
+    Colon,
+    Comma,
+}
+
+public type SendFn func void (void* arg, const char* data, u32 len);
+public type SendFileFn func void (void* arg, i32 fd, u64 len);
+public type CloseFn func void (void* arg);
+public type ErrorFn func void (void* arg, char* msg);
+public type MatchProtoFn func const char* (void* arg, const char** proto, u32 num_protos);
+public type UpgradeFn func void (void* arg, const char* url, const char* proto);
+
+public type PostFn func Status (void* arg, const char* uri, const char* data, u32 data_len);
+public type GetStartFn func Status (void* arg, const char* uri, u64* filesize);
+public type GetCloseFn func void (void* arg);
+public type GetSmallFn func void (void* arg, utils.StringBuffer* reply);
+public type GetLargeFn func i32 (void* arg, utils.StringBuffer* reply);
+
+public type Conn struct {
+    SendFn send;
+    SendFileFn sendFile;
+    CloseFn close;
+    ErrorFn error;
+    MatchProtoFn match;
+    UpgradeFn upgrade;
+    void *arg;
+}
+
+public type Backend struct {
+    PostFn on_post;
+    PostFn on_put;
+    GetStartFn on_get_start;
+    GetSmallFn on_get_small;
+    GetLargeFn on_get_large;
+    GetCloseFn on_get_close;
+    void* arg;
+}
+
+type State enum u8 {
+    None = 0,
+    Incomplete,
+    Complete,
+}
+
+public type Handler struct {
+    // parsing
+    JmpBufTag jmp_err;
+    char[128] err_msg;
+    char* request_data;
+    char* cur;
+    char old_cur;
+    u32 request_len;
+
+    // request
+    utils.StringBuffer* reply;
+    Method request_method;
+    char[512] request_uri;
+    char[128] request_host;
+    u16 request_port;
+    State state;
+    char[80] media_type;
+    char* content;
+    u32 content_len;
+    u32 recv_content;
+    bool keep_alive;
+    bool conn_upgrade;
+    bool ws_upgrade;
+    bool have_origin;
+    u8 ws_version;
+    char[MAX_WS_PROTOS][MAX_WS_PROTO_LEN] ws_protocols;
+    u8 ws_proto_count;
+    char[25] ws_key;
+
+    Conn conn;
+    const char* src_ip;     // no ownership
+    Backend backend;
+    logger.Log* log;
+} @(opaque)
+
+
+static_assert(1328, sizeof(Handler));
+
+public func Handler* Handler.create(const Conn* conn,
+                                    const Backend* backend,
+                                    const char* src_ip,
+                                    logger.Log* log)
+{
+    Handler* h = calloc(1, sizeof(Handler));
+    h.reply = utils.StringBuffer.create(1024*1024);
+    h.conn = *conn;
+    h.src_ip = src_ip;
+    h.backend = *backend;
+    h.log = log;
+    h.reset();
+    return h;
+}
+
+public func void Handler.destroy(Handler* h) {
+    h.reset();
+    h.reply.destroy();
+    if (h.request_data) free(h.request_data);
+    free(h);
+}
+
+func void Handler.reset(Handler* h) {
+    h.reply.clear();
+    h.request_method = Method.Invalid;
+    h.err_msg[0] = 0;
+    h.request_uri[0] = 0;
+    h.request_host[0] = 0;
+    h.request_port = 0;
+    h.state = State.None;
+    h.media_type[0] = 0;
+    if (h.content) free(h.content);
+    h.content = nil;
+    h.content_len = 0;
+    h.recv_content = 0;
+    h.old_cur = 0;
+    h.keep_alive = false;
+    h.conn_upgrade = false;
+    h.ws_upgrade = false;
+    h.ws_version = 0;
+    h.ws_protocols[0][0] = 0;
+    h.ws_proto_count = 0;
+    h.have_origin = false;
+    h.ws_key[0] = 0;
+}
+
+public func void Handler.parse(Handler* h, const char* text, u32 len) {
+    h.request_data = strdup(text);
+    h.cur = h.request_data;
+    h.request_len = len;
+
+    i32 res = setjmp(&h.jmp_err);
+    if (res == 0) { // first time
+        switch (h.state) {
+        case State.None:
+            h.reset();
+            h.parseRequest();
+            break;
+        case State.Incomplete:
+            h.parseContent();
+            break;
+        case State.Complete:
+            // should not happen;
+            break;
+        }
+
+        if (h.state == State.Complete) {
+            if (!h.handleRequest()) return;
+            h.reset();
+        }
+    } else {
+        h.state = State.None;
+        h.conn.error(h.conn.arg, h.err_msg);     // NOTE: may destroy this handle!
+        return;
+    }
+    free(h.request_data);
+    h.request_data = nil;
+    h.cur = nil;
+    h.request_len = 0;
+}
+
+func bool Handler.handleRequest(Handler* h) {
+    switch (h.request_method) {
+    case Method.Invalid:
+        break;
+    case Method.Options:
+        h.sendError(Status.NotImplementd501, true);
+        break;
+    case Method.Get:
+        return h.handleGetRequest();
+    case Method.Head:
+        h.sendError(Status.NotImplementd501, true);
+        break;
+    case Method.Post:
+        h.handlePostRequest();
+        break;
+    case Method.Put:
+        h.handlePutRequest();
+        break;
+    case Method.Delete: fallthrough;
+    case Method.Trace:  fallthrough;
+    case Method.Connect:
+        h.sendError(Status.NotImplementd501, true);
+        break;
+    }
+    return true;
+}
+
+func void addDate(Handler* h, utils.StringBuffer* out) {
+    out.add("Date: ");
+    utils.addRfcDate(out, time(0));
+    out.add("\r\n");
+}
+
+// NOTE: false means upgrade, so handler will be destroyed
+func bool Handler.handleGetRequest(Handler* h) {
+    h.log.debug("GET request '%s' from %s", h.request_uri, h.src_ip);
+    h.reply.clear();
+
+    if (h.ws_upgrade) {
+        // TODO dont check origin for now (not configured in cpa)
+        if (h.ws_key[0] == 0 || h.ws_version != 13 || !h.conn_upgrade /* || !h.have_origin */) {
+            h.sendError(Status.BadRequest400 , true);
+            return true;
+        }
+
+        char*[MAX_WS_PROTOS] protos;
+        for (u32 i=0; i<h.ws_proto_count; i++) protos[i] = h.ws_protocols[i];
+        const char* proto = h.conn.match(h.conn.arg, protos, h.ws_proto_count);
+        if (!proto) {
+            h.log.info("no matching protocols");
+            h.sendError(Status.BadRequest400 , true);
+            return true;
+        }
+        h.log.info("upgrading %s to %s", h.request_uri, proto);
+
+        h.log.debug("upgrade to websocket");
+        h.reply.add("HTTP/1.1 101 Switching Protocols\r\n");
+        h.reply.add("Upgrade: WebSocket\r\n");
+        h.reply.add("Connection: Upgrade\r\n");
+        h.reply.print("WebSocket-Protocol: %s\r\n", proto);
+        char[128] result;
+        i32 len = sprintf(result, "%s%s", h.ws_key, WEBSOCKET_GUID);
+
+        u8[21] hash;
+        sha1.hash(hash, result, cast<u32>(len));
+        char[32] final = { 0 }
+        base64.encode(hash, 20, final);
+
+        h.reply.print("Sec-WebSocket-Accept: %s\r\n", final);
+        h.reply.add("\r\n");
+        h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+        h.conn.upgrade(h.conn.arg, h.request_uri, proto);     // NOTE: will be destroyed after this
+        return false;
+    } else {
+        h.reply.add("HTTP/1.1 200 OK\r\n");
+        h.reply.add("Server: C2Server/1.0.0\r\n");
+        addDate(h, h.reply);
+        // TODO allow sending of big-files > 1Mb
+        // query status + size first (init of get)
+        // NEED: status, content-type, last-modified, content-length
+        // either get buffer or fd
+        // get-close
+        /*
+            2 options:
+            - user fills data + returns status
+            - user returns size + fd, http.c2 uses sendfile on it
+        */
+        u64 filesize = 0;
+        Status status = h.backend.on_get_start(h.backend.arg, h.request_uri, &filesize);
+        if (status != Status.Ok200) {
+            h.sendError(status, false);
+            return true;
+        }
+        if (filesize < 900000) {
+            h.backend.on_get_small(h.backend.arg, h.reply);
+            h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+            h.reply.clear();
+        } else {
+            i32 fd = h.backend.on_get_large(h.backend.arg, h.reply);
+            h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+            h.reply.clear();
+            h.conn.sendFile(h.conn.arg, fd, filesize);
+        }
+        h.backend.on_get_close(h.backend.arg);
+    }
+    return true;
+}
+
+func void Handler.handlePostRequest(Handler* h) {
+    h.log.debug("POST request '%s' from %s", h.request_uri, h.src_ip);
+    h.reply.clear();
+
+    // TODO return 204 if no content
+    h.log.debug("POST body len %u", h.content_len);
+
+    if (strcasecmp(h.media_type, "application/json") != 0) {
+        h.sendError(Status.UnsupportedMediatype415, true);
+        return;
+    }
+
+    Status status = h.backend.on_post(h.backend.arg, h.request_uri, h.content, h.content_len);
+    switch (status) {
+    case Status.Ok200:
+        h.reply.add("HTTP/1.1 200 OK\r\n");
+        h.reply.add("Content-Length: 0\r\n");
+        h.reply.add("\r\n");
+        h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+        h.reply.clear();
+        break;
+    case Status.Created201:              fallthrough;   // should not happen
+    case Status.SwitchingProtocols101:   fallthrough;
+    case Status.BadRequest400:           fallthrough;
+    case Status.Forbidden403:            fallthrough;
+    case Status.NotFound404:             fallthrough;
+    case Status.UnsupportedMediatype415: fallthrough;
+    case Status.NotImplementd501:        fallthrough;
+    case Status.VersionNotSupported505:
+        h.sendError(status, false);
+        break;
+    }
+}
+
+func void Handler.handlePutRequest(Handler* h) {
+    h.log.debug("PUT request '%s' from %s", h.request_uri, h.src_ip);
+    h.reply.clear();
+
+    // TODO return 204 if no content
+
+    Status status = h.backend.on_put(h.backend.arg, h.request_uri, h.content, h.content_len);
+    switch (status) {
+    case Status.Ok200:
+        h.reply.add("HTTP/1.1 200 OK\r\n");
+        h.reply.add("Content-Length: 0\r\n");
+        //h.reply.print("Location: %s\r\n", h.request_uri);
+        h.reply.add("\r\n");
+        h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+        h.reply.clear();
+        break;
+    case Status.Created201:
+        h.reply.add("HTTP/1.1 201 Created\r\n");
+        h.reply.print("Location: %s\r\n", h.request_uri);
+        h.reply.add("Content-Length: 0\r\n");
+        h.reply.add("\r\n");
+        h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+        h.reply.clear();
+        break;
+    case Status.SwitchingProtocols101:   fallthrough;
+    case Status.BadRequest400:           fallthrough;
+    case Status.Forbidden403:            fallthrough;
+    case Status.NotFound404:             fallthrough;
+    case Status.UnsupportedMediatype415: fallthrough;
+    case Status.NotImplementd501:        fallthrough;
+    case Status.VersionNotSupported505:
+        h.sendError(status, false);
+        break;
+    }
+}
+
+func void Handler.sendError(Handler* h, Status s, bool close) {
+    h.reply.clear();
+    switch (s) {
+    case Status.Ok200:  fallthrough;
+    case Status.Created201:
+        return;
+    case Status.SwitchingProtocols101:
+        return;
+    case Status.BadRequest400:
+        h.reply.add("HTTP/1.1 400 Bad Request\r\n");
+        break;
+    case Status.Forbidden403:
+        h.reply.add("HTTP/1.1 403 Forbidden\r\n");
+        break;
+    case Status.NotFound404:
+        h.reply.add("HTTP/1.1 404 Not Found\r\n");
+        break;
+    case Status.UnsupportedMediatype415:
+        h.reply.add("HTTP/1.1 415 Unsupported Media Type\r\n");
+        break;
+    case Status.NotImplementd501:
+        h.reply.add("HTTP/1.1 501 Not Implemented\r\n");
+        break;
+    case Status.VersionNotSupported505:
+        h.reply.add("HTTP/1.1 505 HTTP Version Not Supported\r\n");
+        break;
+    }
+    h.reply.add("Server: C2Server/1.0.0\r\n");
+    h.reply.add("Content-Type: text/html\r\n");
+    h.reply.add("Date: ");
+    addDate(h, h.reply);
+    h.reply.add("\r\n");
+
+    if (close) {
+        h.reply.add("Connection: close\r\n");
+    }
+    h.reply.add("\r\n");
+    h.conn.send(h.conn.arg, h.reply.data(), h.reply.size());
+    h.reply.clear();
+}
+
+func void Handler.error(Handler* h, const char* format, ...) {
+    Va_list args;
+    va_start(args, format);
+    vsprintf(h.err_msg, format, args);
+    va_end(args);
+    longjmp(&h.jmp_err, 1);
+}
+
+func void Handler.parseRequest(Handler* h) {
+    // RFC2616 Section 5 Request
+    h.parseRequestLine();
+
+    h.parseRequestFields();
+    const char* data = h.getWord();
+    h.expectAndConsume(Token.Newline);
+
+    // RFC2616 4.3 Message Body
+    u64 parsed = cast<u64>(h.cur - h.request_data);
+    if (h.content_len != 0) {
+        h.content = malloc(h.content_len + 1);
+        if (h.request_len > parsed) {
+            u32 fragment_len = h.request_len - parsed;
+            memcpy(&h.content[h.recv_content], h.cur, fragment_len);
+            h.recv_content += fragment_len;
+        }
+        h.content[h.recv_content] = 0;
+        if (h.recv_content < h.content_len) {
+            h.log.debug("request fragmented %u/%u", h.recv_content, h.content_len);
+            h.state = State.Incomplete;
+        } else {
+            h.state = State.Complete;
+        }
+    } else {
+        h.state = State.Complete;
+    }
+}
+
+func void Handler.parseContent(Handler* h) {
+    // RFC2616 4.3 Message Body
+    u32 fragment_len = h.request_len;
+    // TODO check overrun
+    memcpy(&h.content[h.recv_content], h.cur, fragment_len);
+    h.recv_content += fragment_len;
+    h.content[h.recv_content] = 0;
+    h.log.debug("recv data %u/%u", h.recv_content, h.content_len);
+    if (h.recv_content >= h.content_len) {
+        h.log.debug("request complete", h.recv_content, h.content_len);
+        h.state = State.Complete;
+    }
+}
+
+func void Handler.parseRequestLine(Handler* h) {
+    // RFC2616 Section 5.1 Request-Line
+    const char* method = h.getWord();
+    sswitch (method) {
+    case "GET":
+        h.request_method = Method.Get;
+    case "POST":
+        h.request_method = Method.Post;
+    case "PUT":
+        h.request_method = Method.Put;
+    case "CONNECT":
+        h.request_method = Method.Connect;
+    case "HEAD":
+        h.request_method = Method.Head;
+    case "OPTIONS":
+        h.request_method = Method.Options;
+    case "DELETE":
+        h.request_method = Method.Delete;
+    case "TRACE":
+        h.request_method = Method.Trace;
+    default:
+        h.request_method = Method.Invalid;
+        h.error("unknown request");
+    }
+
+    h.expectAndConsume(Token.Space);
+    const char* uri = h.getWord();
+
+    h.expectAndConsume(Token.Space);
+    const char* version = h.getWord();
+
+    h.expectAndConsume(Token.Newline);
+
+    char[] supported_version = "HTTP/1.1";
+    if (strcasecmp(supported_version, version) != 0) {
+        h.sendError(Status.VersionNotSupported505, true);
+        // ignore rest of message
+        h.error("unsupported version (%s)", version);
+        return;
+    }
+
+    // TODO properly parse in separate module
+    if (uri[0] != '/') {
+        h.error("only absolute URIs are supported");
+    }
+    // TODO check uri for .. -> not allowed if going outside http-root dir
+    strcpy(h.request_uri, uri);
+}
+
+func void Handler.parseRequestFields(Handler* h) {
+    // RFC2616 Section 5.3 Request Header Fields
+    // RFC2616 Section 4.9 General Header Fields
+
+    while (!h.isNext(Token.Newline)) {
+        const char* field = h.getWord();
+        //h.log.info("FIELD [%s]", field);
+        sswitch (field) {
+// request header fields
+        case "Accept":
+            h.skipRequestHeaderField(field);
+        case "Accept-Charset":
+            h.skipRequestHeaderField(field);
+        case "Accept-Encoding":
+            h.skipRequestHeaderField(field);
+        case "Accept-Language":
+            h.skipRequestHeaderField(field);
+        case "Authorization":
+            h.skipRequestHeaderField(field);
+        case "Expect":
+            h.skipRequestHeaderField(field);
+        case "From":
+            h.skipRequestHeaderField(field);
+        case "Host":
+            h.parseHostHeaderField();
+        case "If-Match":
+            h.skipRequestHeaderField(field);
+        case "If-Modified-Since":
+            h.skipRequestHeaderField(field);
+        case "If-None-Match":
+            h.skipRequestHeaderField(field);
+        case "If-Range":
+            h.skipRequestHeaderField(field);
+        case "If-Unmodified-Since":
+            h.skipRequestHeaderField(field);
+        case "Max-Forwards":
+            h.skipRequestHeaderField(field);
+        case "Proxy-Authorization":
+            h.skipRequestHeaderField(field);
+        case "Range":
+            h.skipRequestHeaderField(field);
+        case "Referer":
+            h.skipRequestHeaderField(field);
+        case "TE":
+            h.skipRequestHeaderField(field);
+        case "User-Agent":
+            h.skipRequestHeaderField(field);
+// RFC2616 4.5 General Header Fields
+        case "Cache-Control":
+            h.skipLine();
+        case "Connection":
+            h.parseConnectionField();
+        case "Pragma":
+            h.skipLine();
+        case "Upgrade":
+            h.parseUpgradeField();
+        // NOTE not needed for requests?
+        // case "Trailer":
+        // case "Transfer-Encoding":
+        // case "Via":
+        // case "Warning":
+        // TODO Upgrade-Insecure??
+
+        // from: https://www.w3.org/TR/upgrade-insecure-requests/
+        case "Upgrade-Insecure-Requests":
+            //printf("skip Upgrade-Insecure-Requests\n");
+            h.skipLine();
+// RFC2616 7.1 Entity Header Fields
+        case "Allow":
+            h.skipLine();
+        case "Content-Encoding":
+            h.skipLine();
+        case "Content-Language":
+            h.skipLine();
+        case "Content-Length":
+            h.parseContentLength();
+        case "Content-Location":
+            h.skipLine();
+        case "Content-MD5":
+            h.skipLine();
+        case "Content-Range":
+            h.skipLine();
+        case "Content-Type":
+            h.parseContentType();
+        case "Expires":
+            h.skipLine();
+        case "Last-Modified":
+            h.skipLine();
+// RFC6454 Origin
+        case "Origin":
+            h.have_origin = true;
+            h.skipLine();
+// RFC6455 WebSockets
+        case "Sec-WebSocket-Key":
+            h.parseWebsocketKeyField();
+        case "Sec-WebSocket-Extensions":
+            h.skipLine();
+        case "Sec-WebSocket-Accept":
+            h.skipLine();
+        case "Sec-WebSocket-Protocol":
+            h.parseWebsocketProtocol();
+        case "Sec-WebSocket-Version":
+            h.parseWebsocketVersion();
+        default:
+            h.error("unhandled request field '%s'", field);
+        }
+    }
+}
+
+func void Handler.skipRequestHeaderField(Handler* h, const char* field) {
+    //printf("skip field %s\n", field);
+    h.expectAndConsume(Token.Colon);
+    h.skipLine();
+}
+
+func void Handler.parseConnectionField(Handler* h) {
+    // RFC2616 19.6.2 Compatibility with HTTP/1.0 Persistent Connections
+    // RFC6455 1.3 Opening Handshake
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+    bool first = true;
+    while (!h.isNext(Token.Newline)) {
+        if (!first) {
+            h.expectAndConsume(Token.Comma);
+            h.expectAndConsume(Token.Space);
+        }
+        const char* arg = h.getWord();
+        if (strcasecmp(arg, "keep-alive") == 0) {
+            h.keep_alive = true;
+        } else if (strcasecmp(arg, "close") == 0) {
+            h.keep_alive = false;
+        } else if (strcasecmp(arg, "Upgrade") == 0) {
+            h.conn_upgrade = true;
+        } else {
+            h.error("unknown Connection argument (%s)", arg);
+        }
+        first = false;
+    }
+    h.expectAndConsume(Token.Newline);
+}
+func void Handler.parseHostHeaderField(Handler* h) {
+    // RFC2616 Section 14.23 Host
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+
+    const char* host = h.getWord();
+    const char* port = nil;
+    if (h.isNext(Token.Colon)) {
+        h.consume(Token.Colon);
+        port = h.getWord();
+    }
+    h.expectAndConsume(Token.Newline);
+
+    i32 port_nr = 80;
+    if (port) port_nr = atoi(port);
+    if (port_nr > 65535) h.error("port number too high");
+
+    strcpy(h.request_host, host);
+    h.request_port = cast<u16>(port_nr);
+    //printf("host %s port %s\n", host, port);
+}
+
+func void Handler.parseWebsocketKeyField(Handler* h) {
+    // RFC6455 11.3.1 Sec-WebSocket-Key
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+    const char* key = h.getWord();
+    h.expectAndConsume(Token.Newline);
+    if (strlen(key) != 24) h.error("invalid sec-websocket-key");
+    strcpy(h.ws_key, key);
+}
+
+func void Handler.parseUpgradeField(Handler* h) {
+    // RFC6455 1.3 Opening Handshake
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+    const char* arg = h.getWord();
+    h.expectAndConsume(Token.Newline);
+    if (strcasecmp(arg, "websocket") == 0) {
+        h.ws_upgrade = true;
+    } else {
+        h.error("unknown update argument (%s)", arg);
+    }
+}
+
+func void Handler.parseContentLength(Handler* h) {
+    // RFC1616 14.13 Content-Length
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+    const char* length = h.getWord();
+    h.expectAndConsume(Token.Newline);
+    // TODO check if ok (sizeof entire msg, etc)
+    // TODO check size != 0
+    h.content_len = cast<u32>(atoi(length));
+    //h.log.debug("media-length: %u", h.content_len);
+}
+
+func void Handler.parseContentType(Handler* h) {
+    // RFC1616 14.17 Content-Type
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+    const char* media_type = h.getWord();
+    h.expectAndConsume(Token.Newline);
+    strncpy(h.media_type, media_type, sizeof(h.media_type));
+    h.media_type[sizeof(h.media_type)-1] = 0;
+    //h.log.debug("media-type: [%s]", h.media_type);
+}
+
+func void Handler.parseWebsocketProtocol(Handler* h) {
+    // RFC6455 11.3.4 Sec-WebSocket-Protocol
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+
+    bool first = true;
+    while (!h.isNext(Token.Newline)) {
+        if (!first) {
+            h.expectAndConsume(Token.Comma);
+            h.expectAndConsume(Token.Space);
+        }
+        const char* proto = h.getWord();
+        if (h.ws_proto_count == MAX_WS_PROTOS) {
+            h.error("too many websocket protocols (max %u)", MAX_WS_PROTOS);
+        }
+        if (strlen(proto) >= MAX_WS_PROTO_LEN) {
+            h.error("websocket protocol too long (max %u)", MAX_WS_PROTO_LEN);
+        }
+        strcpy(h.ws_protocols[h.ws_proto_count], proto);
+        h.ws_proto_count++;
+        first = false;
+    }
+    h.expectAndConsume(Token.Newline);
+}
+
+func void Handler.parseWebsocketVersion(Handler* h) {
+    // RFC6455 11.3.5 Sec-WebSocket-Version
+    h.expectAndConsume(Token.Colon);
+    h.expectAndConsume(Token.Space);
+    const char* version = h.getWord();
+    h.expectAndConsume(Token.Newline);
+    if (strcmp(version, "13") != 0) {
+        h.error("invalid Websocket version (%s)", version);
+    }
+    h.ws_version = 13;
+}
+
+
+func bool Handler.isNext(Handler* h, Token tok) {
+    char first = h.old_cur ? h.old_cur : h.cur[0];
+
+    switch (tok) {
+    case Token.Space:
+        return first == ' ';
+    case Token.Newline:
+        return first == '\r' && h.cur[1] == '\n';
+    case Token.Colon:
+        return first == ':';
+    case Token.Comma:
+        return first == ',';
+    }
+    return false;
+}
+
+func void Handler.consume(Handler* h, Token tok) {
+    switch (tok) {
+    case Token.Space:
+        h.old_cur = 0;
+        h.cur++;
+        break;
+    case Token.Newline:
+        h.old_cur = 0;
+        h.cur += 2;
+        break;
+    case Token.Colon:
+        h.old_cur = 0;
+        h.cur++;
+        break;
+    case Token.Comma:
+        h.old_cur = 0;
+        h.cur++;
+        break;
+    }
+}
+
+func void Handler.expectAndConsume(Handler* h, Token tok) {
+    char first = h.old_cur ? h.old_cur : h.cur[0];
+
+    switch (tok) {
+    case Token.Space:
+        if (first == ' ') {
+            h.old_cur = 0;
+            h.cur++;
+            return;
+        }
+        h.error("expected space");
+        break;
+    case Token.Newline:
+        if (first == '\r' && h.cur[1] == '\n') {
+            h.old_cur = 0;
+            h.cur += 2;
+            return;
+        }
+        h.error("expected newline");
+        break;
+    case Token.Colon:
+        if (first ==  ':') {
+            h.old_cur = 0;
+            h.cur++;
+            return;
+        }
+        h.error("expected colon");
+        break;
+    case Token.Comma:
+        if (first == ',') {
+            h.old_cur = 0;
+            h.cur++;
+            return;
+        }
+        h.error("expected comma");
+        break;
+    }
+}
+
+func char* Handler.getWord(Handler* h) {
+    char* start = h.cur;
+    char* cp = start;
+    while (1) {
+        switch (*cp) {
+        case '\n': fallthrough;
+        case '\r': fallthrough;
+        case ' ':  fallthrough;
+        case ',':  fallthrough;
+        case ':':
+            h.old_cur = *cp;
+            *cp = 0;
+            h.cur = cp;
+            return start;
+        case 0:
+            h.error("unexpected end of file");
+            break;
+        default:
+            break;
+        }
+        cp++;
+    }
+    return nil;
+}
+
+func void Handler.skipLine(Handler* h) {
+    if (h.old_cur) {
+        if (h.old_cur == '\r') {
+            if (h.cur[1] != '\n') h.error("CR without LF");
+            h.old_cur = 0;
+            h.cur += 2;
+            return;
+        } else {
+            h.old_cur = 0;
+            h.cur++;
+        }
+    }
+
+    char* cp = h.cur;
+    while (1) {
+        switch (*cp) {
+        case '\r':
+            if (cp[1] != '\n') h.error("CR without LF");
+            h.cur = cp+2;
+            return;
+        case '\n':
+            h.error("LF without CR");
+            return;
+        case 0:
+            h.cur = cp+1;
+            return;
+        }
+        cp++;
+    }
+}
+

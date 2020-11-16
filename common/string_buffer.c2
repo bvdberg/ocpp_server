@@ -1,0 +1,73 @@
+module utils;
+
+import stdarg local;
+import stdlib local;
+import string local;
+
+public type StringBuffer struct {
+    u32 capacity;
+    u32 size_;
+    char* data_;
+}
+
+public func StringBuffer* StringBuffer.create(u32 capacity)
+{
+    StringBuffer* buf = malloc(sizeof(StringBuffer));
+    buf.capacity = capacity;
+    buf.size_ = 0;
+    buf.data_ = malloc(capacity);
+    return buf;
+}
+
+public func void StringBuffer.destroy(StringBuffer* buf)
+{
+    free(buf.data_);
+    free(buf);
+}
+
+public func u32 StringBuffer.size(const StringBuffer* buf)
+{
+    return buf.size_;
+}
+
+public func const char* StringBuffer.data(const StringBuffer* buf)
+{
+    return buf.data_;
+}
+
+public func void StringBuffer.clear(StringBuffer* buf)
+{
+    buf.data_[0] = 0;
+    buf.size_ = 0;
+}
+
+public func void StringBuffer.add(StringBuffer* buf, const char* text)
+{
+    // TODO grow in addition
+    u32 len = cast<u32>(strlen(text));
+    buf.add2(text, len);
+}
+
+func void StringBuffer.add2(StringBuffer* buf, const char* text, u32 len)
+{
+    if (len >= (buf.capacity - buf.size_)) return;
+    memcpy(&buf.data_[buf.size_], text, len);
+    buf.size_ += len;
+    buf.data_[buf.size_] = 0;
+}
+
+public func void StringBuffer.print(StringBuffer* buf, const char* format, ...) {
+    Va_list args;
+    va_start(args, format);
+    // TODO check size?
+    i32 len = vsprintf(&buf.data_[buf.size_], format, args);
+    buf.size_ += len;
+    va_end(args);
+}
+
+public func void StringBuffer.indent(StringBuffer* buf, u32 indent) {
+    for (u32 i=0; i<indent; i++) {
+        buf.data_[buf.size_++] = ' ';
+    }
+    buf.data_[buf.size_] = 0;
+}

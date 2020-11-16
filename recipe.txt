@@ -1,0 +1,29 @@
+
+executable server
+    $warnings no-unused
+#    $warnings no-unused-parameter
+	$generate-c single-module check
+    $refs
+#    $config DEBUG_HTTP
+#    $deps
+    common/file/reader.c2
+    common/color.c2
+    common/events.c2
+    common/json_builder.c2
+    common/json_data.c2
+    common/json_parser.c2
+    common/logger.c2
+    common/string_buffer.c2
+    common/utils.c2
+    common/base64.c2
+    common/sha1.c2
+    common/linked_list.c2
+    common/tcp_server.c2
+    websockets.c2
+    http.c2
+    webserver.c2
+    ocpp16.c2
+    ocpp20.c2
+    main.c2
+end
+

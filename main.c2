@@ -1,0 +1,183 @@
+module main_mod;
+
+import csignal local;
+import sys_ioctl local;
+import stdlib local;
+import string local;
+import unistd local;
+import stdio local;
+import ctermios local;
+
+import logger;
+import events;
+import webserver;
+import http;
+import utils;
+import ocpp16;
+import ocpp20;
+
+events.Base* base;
+logger.Base logbase;
+ocpp16.Server* ocpp_server;
+
+func http.Status main_on_post(void* arg, const char* uri, const char* data, u32 data_len) {
+    return http.Status.NotImplementd501;
+}
+
+func http.Status main_on_put(void* arg, const char* uri, const char* data, u32 data_len) {
+    return http.Status.NotImplementd501;
+}
+
+func http.Status main_on_get_start(void* arg, const char* uri, u64* filesize) {
+    return http.Status.NotImplementd501;
+}
+
+func void main_on_get_close(void* arg) { }
+
+func void main_on_get_small(void* arg, utils.StringBuffer* reply) { }
+
+func i32 main_on_get_large(void* arg, utils.StringBuffer* reply) {
+    return 0;
+}
+
+func const char* main_on_ws_match(webserver.Session* session, const char** protos, u32 proto_count) {
+    for (u32 i=0; i<proto_count; i++) {
+        sswitch (protos[i]) {
+        case "ocpp1.6": return protos[i];
+        case "ocpp2.0": return protos[i];
+        case "ocpp2.0.1": return protos[i];
+        }
+    }
+    return nil;
+}
+
+func void main_on_ws_open(webserver.Session* session, const char* url, const char* proto) {
+    sswitch (proto) {
+    case "ocpp1.6":
+    // TODO create Protocol interface, need recv + destroy + handle_key
+        ocpp_server = ocpp16.Server.create(session, base, &logbase, url);
+        session.set_user(ocpp_server);
+    case "ocpp2.0":
+        fatal("TODO create OCPP2.0 server");
+        // NOTE: no fallthrough
+    case "ocpp2.0.1":
+        fatal("TODO create OCPP2.0 server");
+    default:
+        fatal("unhandled protocol");
+    }
+}
+
+func void main_on_ws_close(webserver.Session* session)
+{
+    ocpp_server = cast<ocpp16.Server*>(session.get_user());
+    ocpp_server.destroy();
+    ocpp_server = nil;
+}
+
+func void main_on_ws_data(webserver.Session* session, const u8* data, u32 len)
+{
+    ocpp_server = cast<ocpp16.Server*>(session.get_user());
+    ocpp_server.recv(cast<const char*>(data), len);
+}
+
+func void on_keypress(i32 fd, void* arg, u16 flags) {
+    char[1] c;
+    i32 numread = cast<i32>(read(0, c, 1));
+    if (numread <= 0) {
+        fprintf(stderr, "error reading keyboard\n");
+        base.loopbreak(EXIT_FAILURE);
+    }
+    // TODO pass keys to ocpp_server (if not nil)
+    switch (c[0]) {
+    case 10:
+        printf("\n");
+        break;
+    case 'h':
+        printf("Keys:\n");
+        printf("   h        help\n");
+        printf("   q        quit\n");
+        printf("   ?        show ocpp commands\n");
+        printf("  (rest)    ocpp command\n");
+        break;
+    case 'q':
+        base.loopbreak(EXIT_FAILURE);
+        break;
+    default:
+        if (ocpp_server) ocpp_server.handle_key(c[0]);
+        break;
+    }
+}
+
+public func i32 main(i32 argc, char** argv) {
+    u16 port = 8081;
+
+    utils.init();
+
+    logbase.init(logger.Level.Info, unistd.isatty(1), false);
+
+    logger.Log log;
+    log.init(&logbase, "server");
+    //log.setLevel(logger.Level.Debug);
+
+    log.info("starting");
+
+    base = events.Base.create();
+
+    Sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_flags = SA_NOCLDSTOP|SA_RESTART;
+	act.sa_handler = signal_handler;
+    if (sigaction(SIGINT, &act, nil) != 0) fatal("sigaction(SIGINT)");
+    if (sigaction(SIGTERM, &act, nil) != 0) fatal("sigaction(SIGTERM)");
+
+    http.Backend backend;
+    backend.on_post = main_on_post;
+    backend.on_put = main_on_put;
+    backend.on_get_start = main_on_get_start;
+    backend.on_get_close = main_on_get_close;
+    backend.on_get_small = main_on_get_small;
+    backend.on_get_large = main_on_get_large;
+    backend.arg = &log;
+
+    webserver.Protocol protocol;
+    protocol.on_match = main_on_ws_match;
+    protocol.on_open = main_on_ws_open;
+    protocol.on_close = main_on_ws_close;
+    protocol.on_data = main_on_ws_data;
+    protocol.arg = &log;
+    webserver.Server* server = webserver.create(base, &backend, &protocol, &log, port);
+
+    Termios old_term;
+    Termios new_term;
+    ioctl(0, TCGETS, &old_term);
+    new_term = old_term;
+    new_term.c_lflag &= ~ECHO;
+    new_term.c_lflag &= ~ICANON;
+    new_term.c_cc[VMIN] = 1;
+    new_term.c_cc[VTIME] = 1;
+    ioctl(0, TCSETS, &new_term);
+
+    events.Event keyboard;
+    keyboard.assign(base, 0, events.READ, on_keypress, nil);
+    keyboard.add();
+
+    u8 ret = base.mainloop();
+
+    ioctl(0, TCSETS, &old_term);
+    keyboard.del();
+
+    server.destroy();
+    base.destroy();
+    logbase.destroy();
+
+    return ret;
+}
+
+func void fatal(const char* msg) {
+	exit(EXIT_FAILURE);
+}
+
+func void signal_handler(i32 num) {
+    base.loopbreak(EXIT_SUCCESS);
+}
+

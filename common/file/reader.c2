@@ -1,0 +1,87 @@
+module file_utils;
+
+import stdio local;
+import libc_fcntl local;
+import string local;
+import c_errno local;
+import sys_stat local;
+import sys_mman local;
+import unistd local;
+
+public type Reader struct {
+    void* region;
+    u32 size;
+    i32 errno;
+    i32 fd;
+}
+
+public func bool Reader.open(Reader* file, const char* filename, u64* modtime) {
+    file.errno = 0;
+    file.fd = -1;
+    file.region = nil;
+
+    i32 fd = open(filename, O_RDONLY);
+    if (fd == -1) {
+        file.errno = *errno2();
+        return false;
+    }
+
+    Stat statbuf;
+    i32 err = fstat(fd, &statbuf);
+    if (err) {
+        file.errno = *errno2();
+        close(fd);
+        printf("error opening %s: %s\n", filename, strerror(file.errno));
+        return false;
+    }
+
+    switch (statbuf.st_mode & S_IFMT) {
+    case S_IFBLK:  fallthrough; // block device
+    case S_IFCHR:  fallthrough; // character device
+    case S_IFDIR:  fallthrough; // directory
+    case S_IFIFO:  fallthrough; // FIFO/pipe
+    case S_IFLNK:  // symlink
+        close(fd);
+        return false;
+    case S_IFREG:  // regular file
+        break;
+    case S_IFSOCK: fallthrough; // socket
+    default:       // unknown
+        close(fd);
+        return false;
+    }
+
+    file.size = cast<u32>(statbuf.st_size);
+
+    file.fd = fd;
+    if (modtime) *modtime = statbuf.st_mtime;
+    return true;
+}
+
+public func bool Reader.map(Reader* file) {
+    file.region = mmap(0, file.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_POPULATE, file.fd, 0);
+    if (file.region == MAP_FAILED) {
+        file.errno = *errno2();
+        file.region = nil;
+        //perror("mmap");
+        return false;
+    }
+    return true;
+}
+
+public func void Reader.close(Reader* file) {
+    if (file.region) munmap(file.region, file.size);
+	if (file.fd != -1) {
+        close(file.fd);
+        file.fd = -1;
+    }
+}
+
+public func u8* Reader.data(Reader* file) {
+    return cast<u8*>(file.region);
+}
+
+public func bool Reader.isEmpty(const Reader* file) {
+    return file.size == 0;
+}
+

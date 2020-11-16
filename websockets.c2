@@ -1,0 +1,212 @@
+module websockets;
+
+import stdlib local;
+import string local;
+import logger;
+
+public type SendFn func void (void* arg, const u8* data, u32 len);
+public type RecvFn func void (void* arg, const u8* data, u32 len);
+public type CloseFn func void (void* arg);
+
+public type Handler struct {
+    bool is_server;
+    SendFn send;
+    RecvFn recv;
+    CloseFn close;
+    void* arg;
+    logger.Log* log;
+
+    u32 capacity;
+    u32 bufsize;
+    u8* buf;
+} @(opaque)
+
+public func Handler* Handler.create(bool is_server, SendFn send, RecvFn recv, CloseFn close, void* arg, logger.Log* log)
+{
+    Handler* h = calloc(1, sizeof(Handler));
+    h.is_server = is_server;
+    h.send = send;
+    h.recv = recv;
+    h.close = close;
+    h.arg = arg;
+    h.log = log;
+
+    h.capacity = 16*1014;
+    h.buf = malloc(h.capacity);
+    h.bufsize = 0;
+    return h;
+}
+
+public func void Handler.destroy(Handler* h) {
+    free(h.buf);
+    free(h);
+}
+
+// NOTE: in and out may be same pointer!
+func void maskData(u8* out, const u8* in, u32 size, const u8* mask) {
+    for (u32 i=0; i<size; i++) {
+        out[i] = in[i] ^ mask[i%4];
+    }
+}
+
+type Opcode enum u8{
+    TEXT     = 0x1,
+    BINARY   = 0x2,
+    CLOSE    = 0x8,
+    PING     = 0x9,
+    PONG     = 0xA,
+}
+
+func const char* opcode2str(u8 opcode) {
+    switch (opcode) {
+    case 0x0:           return "continuation";
+    case Opcode.TEXT:   return "text";
+    case Opcode.BINARY: return "binary";
+    case 0x3: fallthrough;
+    case 0x4: fallthrough;
+    case 0x5: fallthrough;
+    case 0x6: fallthrough;
+    case 0x7:           return "non-control";
+    case Opcode.CLOSE:  return "conn close";
+    case Opcode.PING:   return "ping";
+    case Opcode.PONG:   return "pong";
+    case 0xB: fallthrough;
+    case 0xC: fallthrough;
+    case 0xD: fallthrough;
+    case 0xE: fallthrough;
+    case 0xF:   return "reserved";
+    }
+    return "??";
+}
+
+func void Handler.transmit(Handler* h, const u8* data, u32 size, Opcode opcode)
+{
+    // RFC 6455 5.1: A server MUST NOT mask any frames it sends to a client
+    // TODO make size dynamic
+    u8[32*1024] frame;
+    if (size > sizeof(frame)) h.log.fatal("transmit message too big");
+    frame[0] = 0x80 | opcode;     // FIN + opcode
+    u32 header = 1;
+    if (size <= 125) {
+        frame[1] = (0x00 | cast<u8>(size));   // NO mask + size<126
+        header += 1;
+    } else if (size <= 65535) {
+        frame[1] = (0x00 | 126);
+        frame[2] = (cast<u8>(size >> 8) & 0xFF);
+        frame[3] = cast<u8>(size & 0xFF);
+        header += 3;
+    } else {
+        h.log.fatal("large size >65535 not supported!");
+    }
+    if (!h.is_server) {     // 5.2 client must mask any data sent to the server
+        u32 mask_key = cast<u32>(stdlib.rand());
+        // TODO order ok?
+        frame[header+0] = cast<u8>((mask_key >> 24) & 0xFF);
+        frame[header+1] = cast<u8>((mask_key >> 16) & 0xFF);
+        frame[header+2] = cast<u8>((mask_key >>  8) & 0xFF);
+        frame[header+3] = cast<u8>((mask_key >>  0) & 0xFF);
+        header += 4;
+        maskData(&frame[header], data, size, &frame[header-4]);
+    } else {
+        memcpy(&frame[header], data, size);
+    }
+    u32 len = header + size;
+    h.send(h.arg, frame, len);
+}
+
+public func void Handler.write(Handler* h, const char* data, u32 size) {
+    h.transmit(cast<const u8*>(data), size, Opcode.TEXT);
+}
+
+public func void Handler.on_data(Handler* h, const u8* data, u32 len) {
+    // RFC6455 5.2 Base Framing Protocol
+    // TODO de-fragmentize and remove frame
+    // TODO handle overflow, just re-alloc
+    if (len >= (h.capacity - h.bufsize)) {
+        h.log.error("ws: overflow");
+        h.close(h.arg);
+        return;
+    }
+    memcpy(&h.buf[h.bufsize], data, len);
+    h.bufsize += len;
+
+    while (h.bufsize) {
+        bool fin = (data[0] & 0x80) >> 7;
+        if (!fin) { h.log.debug("Fragmentation not supported"); }
+
+        u8 opcode = h.buf[0] & 0x0F;
+        bool haveMask = (h.buf[1] & 0x80) >> 7;
+        if (h.is_server && !haveMask) {
+            h.close(h.arg);
+            return;
+        }
+        u32 payload = h.buf[1] & 0x7F;
+        u8* cp = h.buf + 2;
+        if (payload == 126) {
+            payload = (h.buf[2] << 8) | h.buf[3];
+            cp += 2;
+        } else if (payload == 127) {
+            h.log.error("BIG frames not supported");
+            h.close(h.arg);
+            return;
+        }
+        //h.log.debug("WS data fin=%d, opcode=0x%x(%s) mask=%d, payload=%d", fin, opcode, opcode2str(opcode), haveMask, payload);
+        u8[4] mask;
+        if (haveMask) {
+            mask[0] = cp[0];
+            mask[1] = cp[1];
+            mask[2] = cp[2];
+            mask[3] = cp[3];
+            cp += 4;
+        }
+        u32 hdr_len = cast<u32>(cp - h.buf);
+        u32 frame_len = hdr_len + payload;
+        if (h.bufsize < frame_len) return;   // incomplete frame
+
+        if (haveMask) maskData(cp, cp, payload, mask);
+
+        switch (opcode) {
+        case Opcode.TEXT:
+            // 0-terminate, restore byte afterwards
+            u8 old = cp[payload];
+            cp[payload] = 0;
+            h.recv(h.arg, cp, payload); // NOTE: we may be destroyed after this call
+            // TODO dont write cp, since we may have been destroyed!
+            cp[payload] = old;
+            // TODO also don't break, but return?
+            break;
+        case Opcode.BINARY:
+            h.log.warn("unsupported BINARY frame");
+            break;
+        case Opcode.CLOSE:
+            h.log.warn("CLOSE");
+            if (payload) {
+                //assert(payload >= 2);
+                //u32 reason = (unmask[0] << 8) | unmask[1];
+                //printf("  close: reason=%d", reason);
+                // NOTE: for value semantics, see:  https://tools.ietf.org/html/rfc6455#section-7.4
+                //printf("  text='%s'", unmask+2);
+                //printf("\n");
+            }
+            h.close(h.arg); // NOTE: we may be destroyed after this call
+            return;
+        case Opcode.PING:
+            h.transmit(cp, payload, Opcode.PONG);
+            break;
+        case Opcode.PONG:
+            h.log.warn("got WS PONG");
+            break;
+        default:
+            h.log.warn("unsupported opcode (%u)", opcode);
+            break;
+        }
+        // TODO consume
+        u32 left = h.bufsize - frame_len;
+        if (left) {
+            memmove(&h.buf[0], &h.buf[frame_len], left);
+        }
+        h.bufsize -= frame_len;
+        // TODO back to while
+    }
+}
+
