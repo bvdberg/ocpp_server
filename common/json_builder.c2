@@ -32,7 +32,7 @@ public func const char* Builder.getData(const Builder* b) {
 }
 
 public func u32 Builder.getSize(const Builder* b) {
-    return b.size + 1;  // include 0-termination
+    return b.size;
 }
 
 public func void Builder.addNumber(Builder* b, const char* key, i64 value) {

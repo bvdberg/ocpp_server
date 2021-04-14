@@ -108,8 +108,26 @@ func void on_keypress(i32 fd, void* arg, u16 flags) {
     }
 }
 
+func void usage(const char* me) {
+    fprintf(stderr, "Usage: %s [-p <port>]\n", me);
+    exit(EXIT_FAILURE);
+}
+
 public func i32 main(i32 argc, char** argv) {
     u16 port = 8081;
+
+    switch (argc) {
+    case 1:
+        break;
+    case 3:
+        if (strcmp(argv[1], "-p") != 0) usage(argv[0]);
+        port = cast<u16>(atoi(argv[2]));
+        break;
+    default:
+        usage(argv[0]);
+        break;
+    }
+
 
     utils.init();
 
@@ -117,9 +135,7 @@ public func i32 main(i32 argc, char** argv) {
 
     logger.Log log;
     log.init(&logbase, "server");
-    //log.setLevel(logger.Level.Debug);
-
-    log.info("starting");
+    log.setLevel(logger.Level.Debug);
 
     base = events.Base.create();
 

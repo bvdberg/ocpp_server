@@ -149,7 +149,7 @@ func const char* on_http_match(void* arg, const char** protos, u32 proto_count) 
 func void on_http_upgrade(void* arg, const char* url, const char* proto) {
     Session* s = cast<Session*>(arg);
     s.server.log.debug("upgrade connection to %s", proto);
-    s.ws_handler = websockets.Handler.create(true, on_ws_send, on_ws_recv, on_ws_close, s, s.server.log);
+    s.ws_handler = websockets.Handler.create(s.server.base, true, on_ws_send, on_ws_recv, on_ws_close, s, s.server.log);
     s.protocol.on_open(s, url, proto);
     s.http_handler.destroy();
     s.http_handler = nil;

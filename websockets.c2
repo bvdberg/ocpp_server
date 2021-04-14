@@ -3,6 +3,7 @@ module websockets;
 import stdlib local;
 import string local;
 import logger;
+import events;
 
 public type SendFn func void (void* arg, const u8* data, u32 len);
 public type RecvFn func void (void* arg, const u8* data, u32 len);
@@ -15,13 +16,13 @@ public type Handler struct {
     CloseFn close;
     void* arg;
     logger.Log* log;
-
+    events.Timer ping_timer;
     u32 capacity;
     u32 bufsize;
     u8* buf;
 } @(opaque)
 
-public func Handler* Handler.create(bool is_server, SendFn send, RecvFn recv, CloseFn close, void* arg, logger.Log* log)
+public func Handler* Handler.create(events.Base* base, bool is_server, SendFn send, RecvFn recv, CloseFn close, void* arg, logger.Log* log)
 {
     Handler* h = calloc(1, sizeof(Handler));
     h.is_server = is_server;
@@ -30,16 +31,24 @@ public func Handler* Handler.create(bool is_server, SendFn send, RecvFn recv, Cl
     h.close = close;
     h.arg = arg;
     h.log = log;
+    h.ping_timer.assign(base, 0, on_ping_timer, h);
+
 
     h.capacity = 16*1014;
     h.buf = malloc(h.capacity);
     h.bufsize = 0;
+    //h.ping_timer.add(events.sec(5)); // enable to start pings
     return h;
 }
 
 public func void Handler.destroy(Handler* h) {
     free(h.buf);
     free(h);
+}
+
+func void on_ping_timer(void* arg) {
+    Handler* h = cast<Handler*>(arg);
+    h.transmit(nil, 0, Opcode.PING);
 }
 
 // NOTE: in and out may be same pointer!
@@ -98,17 +107,16 @@ func void Handler.transmit(Handler* h, const u8* data, u32 size, Opcode opcode)
     } else {
         h.log.fatal("large size >65535 not supported!");
     }
-    if (!h.is_server) {     // 5.2 client must mask any data sent to the server
+    if (h.is_server) {
+        if (size) memcpy(&frame[header], data, size);
+    } else { // 5.2 client must mask any data sent to the server
         u32 mask_key = cast<u32>(stdlib.rand());
-        // TODO order ok?
         frame[header+0] = cast<u8>((mask_key >> 24) & 0xFF);
         frame[header+1] = cast<u8>((mask_key >> 16) & 0xFF);
         frame[header+2] = cast<u8>((mask_key >>  8) & 0xFF);
         frame[header+3] = cast<u8>((mask_key >>  0) & 0xFF);
         header += 4;
-        maskData(&frame[header], data, size, &frame[header-4]);
-    } else {
-        memcpy(&frame[header], data, size);
+        if (size) maskData(&frame[header], data, size, &frame[header-4]);
     }
     u32 len = header + size;
     h.send(h.arg, frame, len);
@@ -131,7 +139,7 @@ public func void Handler.on_data(Handler* h, const u8* data, u32 len) {
     h.bufsize += len;
 
     while (h.bufsize) {
-        bool fin = (data[0] & 0x80) >> 7;
+        bool fin = (h.buf[0] & 0x80) >> 7;
         if (!fin) { h.log.debug("Fragmentation not supported"); }
 
         u8 opcode = h.buf[0] & 0x0F;
@@ -191,10 +199,11 @@ public func void Handler.on_data(Handler* h, const u8* data, u32 len) {
             h.close(h.arg); // NOTE: we may be destroyed after this call
             return;
         case Opcode.PING:
+            h.log.info("got ping");
             h.transmit(cp, payload, Opcode.PONG);
             break;
         case Opcode.PONG:
-            h.log.warn("got WS PONG");
+            h.log.info("got pong");
             break;
         default:
             h.log.warn("unsupported opcode (%u)", opcode);

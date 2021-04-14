@@ -110,6 +110,7 @@ public type Server struct {
     u32 selected_port;
     u32 heartbeat_interval;
     i32 list_version;
+    u32[3] cp_limit;
 } @(opaque)
 
 
@@ -133,6 +134,9 @@ public func Server* Server.create(webserver.Session* session,
     //s.reject_bootnotification = true;
     s.reject_bootnotification = false;
     s.selected_port = 1;
+    s.cp_limit[0] = 32;
+    s.cp_limit[1] = 16;
+    s.cp_limit[2] = 16;
     for (u32 i=0; i<elemsof(s.port_operative); i++) s.port_operative[i] = true;
     return s;
 }
@@ -225,9 +229,10 @@ func bool Server.handle_call(Server* s, json.Iter* iter, const char* msg_id) {
     case "Authorize":
         const char* idtag = iter.find_text("idTag");
         if (!idtag) return false;
-        bool authorized = false;
+        bool authorized = true;
         // Hardcoded key tag
-        if (strcmp(idtag, "043ba1b24d5380") == 0) authorized = true;
+        //if (strcmp(idtag, "043ba1b24d5380") == 0) authorized = true;
+        //if (strcmp(idtag, "TODO") == 0) authorized = false;
 
         s.log.info("authorization of tag %s: %s", idtag, authorized ? "authorized" : "rejected");
         s.start_reply(msg_id);
@@ -240,8 +245,12 @@ func bool Server.handle_call(Server* s, json.Iter* iter, const char* msg_id) {
         const char* model = iter.find_text("chargePointModel");
         const char* serial = iter.find_text("chargePointSerialNumber");
         const char* fwversion  = iter.find_text("firmwareVersion");
-        if (!model || !vendor) {
-            s.log.warn("invalid BootNotification msg");
+        if (!model) {
+            s.log.warn("invalid BootNotification msg (missing chargePointModel)");
+            return false;
+        }
+        if (!vendor) {
+            s.log.warn("invalid BootNotification msg (missing chargePointVendor)");
             return false;
         }
         const char* iccid  = iter.find_text("iccid");
@@ -410,7 +419,14 @@ func void Server.handle_call_result(Server* s, json.Iter* iter, const char* msg_
     case CallType.GetConfiguration:
         // TODO print
         break;
-    case CallType.GetDiagnostics:                   fallthrough;
+    case CallType.GetDiagnostics:
+        const char* filename = iter.find_text("fileName");
+        if (!filename) {
+            s.log.warn("missing fileName in reply for GetDiagnostics");
+            return;
+        }
+        s.log.info("diagnostics filename: %s", filename);
+        return;
     case CallType.GetLocalListVersion:              fallthrough;
     case CallType.RemoteStartTransaction:           fallthrough;
     case CallType.RemoteStopTransaction:            fallthrough;
@@ -418,9 +434,11 @@ func void Server.handle_call_result(Server* s, json.Iter* iter, const char* msg_
     case CallType.SetChargingProfile:               fallthrough;
     case CallType.SendLocalList:                    fallthrough;
     case CallType.TriggerMessage:                   fallthrough;
-    case CallType.UnlockConnector:                  fallthrough;
-    case CallType.UpdateFirmware:
+    case CallType.UnlockConnector:
         break;
+    case CallType.UpdateFirmware:
+        s.log.info("firmware update ok");
+        return;
     }
     s.log.warn("TODO handle call result");
 
@@ -467,12 +485,47 @@ func const char* Server.get_next_uuid(Server* s) {
     return uuid2str(s.uuid, sizeof(s.uuid));
 }
 
+type ProfilePeriods struct {
+    u32 start;
+    u32 limit;
+}
+
+func void Server.send_cp_max(Server* s) {
+    s.log.info("change current limit (port %u) to %u A", s.selected_port, s.cp_limit[s.selected_port]);
+    s.start_call(s.get_next_uuid(), CallType.SetChargingProfile);
+    s.builder.addNumber("connectorId", s.selected_port);
+    s.builder.addObject("csChargingProfiles");
+    s.builder.addNumber("chargingProfileId", 1);
+    s.builder.addNumber("stackLevel", 0);
+    s.builder.addValue("chargingProfilePurpose", "ChargePointMaxProfile");
+    s.builder.addValue("chargingProfileKind", "Absolute");
+    s.builder.addValue("validFrom", get_utc_time(0)); // now
+    s.builder.addValue("validTo", get_utc_time(86400)); // now + 24h
+    s.builder.addObject("chargingSchedule");
+    s.builder.addValue("startSchedule", get_utc_time(0)); // now
+    s.builder.addNumber("duration", 86400);
+    s.builder.addValue("chargingRateUnit", "A");
+    s.builder.addArray("chargingSchedulePeriod");
+
+    s.builder.addObject(nil);
+    s.builder.addNumber("startPeriod", 0);
+    s.builder.addNumber("limit", s.cp_limit[s.selected_port]);
+    s.builder.addNumber("numberPhases", 3);
+    s.builder.closeObject();
+
+    s.builder.closeArray();
+    s.builder.closeObject();
+    s.builder.closeObject();
+    s.finish_and_send_msg();
+}
+
 public func void Server.handle_key(Server* s, char key) {
     switch (key) {
     case '?':
         printf("OCPP commands:\n");
-        printf("   +/-    increase/decrease log level\n");
+        printf("   +/-    increase/decrease CP max (1A steps)\n");
         printf("   0-2    select port\n");
+        printf("   3-4    increase/decrease log level\n");
         printf("   5-9    send json command from file (cmdX.json)\n");
         printf("   a      change availability (selected port)\n");
         printf("   b      send big msg (> 8Kb)\n");
@@ -488,6 +541,7 @@ public func void Server.handle_key(Server* s, char key) {
         printf("   l      send local-list\n");
         printf("   m      send trigger message (for StatusNotification)\n");
         printf("   o      get composite charging schedule (week)\n");
+        printf("   p      send profile (selected port)\n");
         printf("   r      soft-reset\n");
         printf("   R      hard-reset\n");
         printf("   s      remote start transaction\n");
@@ -500,22 +554,30 @@ public func void Server.handle_key(Server* s, char key) {
         printf("   z      set MeterValue interval to 60\n");
         break;
     case '+':
-        if (s.log.level != logger.Level.Debug) {
-            s.log.info("increase loglevel");
-            s.log.setLevel(logger.Level.Debug);
-        }
+        s.cp_limit[s.selected_port]++;
+        s.send_cp_max();
         break;
     case '-':
-        if (s.log.level != logger.Level.Info) {
-            s.log.info("decrease loglevel");
-            s.log.setLevel(logger.Level.Info);
-        }
+        if (s.cp_limit[s.selected_port] > 0) s.cp_limit[s.selected_port]--;
+        s.send_cp_max();
         break;
     case '0':   fallthrough;
     case '1':   fallthrough;
     case '2':
         s.selected_port = cast<u32>(key - '0');
         s.log.info("selecting port %d", s.selected_port);
+        break;
+    case '3':
+        if (s.log.level != logger.Level.Debug) {
+            s.log.info("increase loglevel");
+            s.log.setLevel(logger.Level.Debug);
+        }
+        break;
+    case '4':
+        if (s.log.level != logger.Level.Info) {
+            s.log.info("decrease loglevel");
+            s.log.setLevel(logger.Level.Info);
+        }
         break;
     case '5':   fallthrough;
     case '6':   fallthrough;
@@ -578,15 +640,21 @@ public func void Server.handle_key(Server* s, char key) {
     case 'f':
         s.log.info("sending firmware update");
         s.start_call(s.get_next_uuid(), CallType.UpdateFirmware);
-        // TODO fill in own ipnr
-        s.builder.addValue("location", "192.168.4.109:8080/files/update.swu");
+        // TODO automatically fill in own ipnr
+        // WORK
+        //s.builder.addValue("location", "192.168.4.109:8080/files/update.swu");
+        // HOME for white module
+        s.builder.addValue("location", "ftp://ecotap:ecotap123@192.168.178.18/EVC50V32R17-DC.bin");
         s.builder.addValue("retrieveDate", get_utc_time(2));   // 2 seconds in the future
         s.finish_and_send_msg();
         break;
     case 'g':
         s.log.info("getting diagnostics of last hour");
         s.start_call(s.get_next_uuid(), CallType.GetDiagnostics);
-        s.builder.addValue("location", "ftp://192.168.4.160:21/Diagnostics");
+        // WORK
+        //s.builder.addValue("location", "ftp://192.168.4.160:21/Diagnostics");
+        // HOME
+        s.builder.addValue("location", "ftp://ecotap:ecotap123@192.168.178.18:21/upload");
         s.builder.addNumber("retries", 10);
         s.builder.addNumber("retryInterval", 8);
         s.builder.addValue("startTime", get_utc_time(-60*60));
@@ -596,7 +664,10 @@ public func void Server.handle_key(Server* s, char key) {
     case 'G':
         s.log.info("getting all diagnostics");
         s.start_call(s.get_next_uuid(), CallType.GetDiagnostics);
-        s.builder.addValue("location", "ftp://192.168.4.160:21/Diagnostics");
+        // WORK
+        //s.builder.addValue("location", "ftp://192.168.4.160:21/Diagnostics");
+        // HOME
+        s.builder.addValue("location", "ftp://ecotap:ecotap123@192.168.178.18:21/upload");
         s.finish_and_send_msg();
         break;
     case 'H':
@@ -707,6 +778,38 @@ public func void Server.handle_key(Server* s, char key) {
         s.builder.addValue("chargingRateUnit", "A");
         s.finish_and_send_msg();
         break;
+    case 'p':
+        s.log.info("sending profile to port %u", s.selected_port);
+        s.start_call(s.get_next_uuid(), CallType.SetChargingProfile);
+        s.builder.addNumber("connectorId", s.selected_port);
+        s.builder.addObject("csChargingProfiles");
+        s.builder.addNumber("chargingProfileId", 1);
+        s.builder.addNumber("stackLevel", 0);
+        s.builder.addValue("chargingProfilePurpose", "ChargePointMaxProfile");
+        s.builder.addValue("chargingProfileKind", "Absolute");
+        s.builder.addValue("validFrom", get_utc_time(0)); // now
+        s.builder.addValue("validTo", get_utc_time(86400)); // now + 24h
+        s.builder.addObject("chargingSchedule");
+        s.builder.addValue("startSchedule", get_utc_time(0)); // now
+        s.builder.addNumber("duration", 86400);
+        s.builder.addValue("chargingRateUnit", "W");
+        s.builder.addArray("chargingSchedulePeriod");
+
+        ProfilePeriods[10] periods;
+        u32 num = s.parse_profile("profile1.json", periods, elemsof(periods));
+        for (u32 i=0; i<num; i++) {
+            s.builder.addObject(nil);
+            s.builder.addNumber("startPeriod", periods[i].start);
+            s.builder.addNumber("limit", periods[i].limit);
+            s.builder.addNumber("numberPhases", 3);
+            s.log.info("adding profile period %4u, limit %4u", periods[i].start, periods[2].limit);
+            s.builder.closeObject();
+        }
+        s.builder.closeArray();
+        s.builder.closeObject();
+        s.builder.closeObject();
+        s.finish_and_send_msg();
+        break;
     case 'r':
         s.log.info("requesting soft reset");
         s.start_call(s.get_next_uuid(), CallType.Reset);
@@ -741,7 +844,7 @@ public func void Server.handle_key(Server* s, char key) {
         s.finish_and_send_msg();
         break;
     case 'u':
-        s.log.info("requesting connector unlock (port %u)");
+        s.log.info("requesting connector unlock (port %u)", s.selected_port);
         s.start_call(s.get_next_uuid(), CallType.UnlockConnector);
         s.builder.addNumber("connectorId", s.selected_port);
         s.finish_and_send_msg();
@@ -795,5 +898,62 @@ public func void Server.handle_key(Server* s, char key) {
         s.finish_and_send_msg();
         break;
     }
+}
+
+func u32 parse_profile_content(json.Parser* parser, ProfilePeriods* periods, u32 max)
+{
+    json.Iter iter = parser.getArrayIter("periods");
+    if (iter.done()) {
+        printf("syntax error: no periods found\n");
+        return 0;
+    }
+    u32 count = 0;
+    while (!iter.done()) {
+        if (count == max) {
+            printf("syntax error: too many periods (max %u)\n", max);
+            break;
+        }
+        const char* start = iter.find_text("start");
+        const char* limit = iter.find_text("limit");
+        if (!start || !limit) {
+            printf("syntax error: missing start / limit\n");
+            return 0;
+        }
+        periods[count].start = cast<u32>(atoi(start));
+        periods[count].limit = cast<u32>(atoi(limit));
+        count++;
+        iter.next();
+    }
+    return count;
+}
+
+func u32 Server.parse_profile(Server* s, const char* filename, ProfilePeriods* periods, u32 max) {
+    file_utils.Reader file;
+    if (!file.open(filename, nil)) {
+        s.log.error("cannot open %s: %s", filename, strerror(file.errno));
+        return 0;
+    }
+
+    if (!file.map()) return 0;
+
+    if (file.isEmpty()) {
+        s.log.error("file %s is empty", filename);
+        file.close();
+        return 0;
+    }
+
+    json.Parser parser;
+    parser.init();
+
+    bool ok = parser.parse(cast<const char*>(file.data()));
+    u32 num = 0;
+    if (ok) {
+        num = parse_profile_content(&parser, periods, max);
+    } else {
+        fprintf(stderr, "error parsing %s: %s\n", filename, parser.getDiag());
+    }
+    parser.destroy();
+    file.close();
+    return num;
 }
 

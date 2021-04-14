@@ -89,7 +89,7 @@ public type Handler struct {
     // parsing
     JmpBufTag jmp_err;
     char[128] err_msg;
-    char* request_data;
+    char[4096] request_data;
     char* cur;
     char old_cur;
     u32 request_len;
@@ -121,7 +121,7 @@ public type Handler struct {
 } @(opaque)
 
 
-static_assert(1328, sizeof(Handler));
+static_assert(5416, sizeof(Handler));
 
 public func Handler* Handler.create(const Conn* conn,
                                     const Backend* backend,
@@ -141,7 +141,6 @@ public func Handler* Handler.create(const Conn* conn,
 public func void Handler.destroy(Handler* h) {
     h.reset();
     h.reply.destroy();
-    if (h.request_data) free(h.request_data);
     free(h);
 }
 
@@ -170,9 +169,19 @@ func void Handler.reset(Handler* h) {
 }
 
 public func void Handler.parse(Handler* h, const char* text, u32 len) {
-    h.request_data = strdup(text);
+    if (h.request_len + len >= sizeof(h.request_data)-1) {
+        h.conn.error(h.conn.arg, h.err_msg);     // NOTE: may destroy this handle!
+        return;
+    }
+    memcpy(&h.request_data[h.request_len], text, len);
+    h.request_len += len;
+    h.request_data[h.request_len] = 0;
+
+    if (h.request_len < 80 || strcmp(&h.request_data[h.request_len-4], "\r\n\r\n") != 0) {
+        return; // wait for more
+    }
+
     h.cur = h.request_data;
-    h.request_len = len;
 
     i32 res = setjmp(&h.jmp_err);
     if (res == 0) { // first time
@@ -198,8 +207,7 @@ public func void Handler.parse(Handler* h, const char* text, u32 len) {
         h.conn.error(h.conn.arg, h.err_msg);     // NOTE: may destroy this handle!
         return;
     }
-    free(h.request_data);
-    h.request_data = nil;
+    h.request_data[0] = 0;
     h.cur = nil;
     h.request_len = 0;
 }

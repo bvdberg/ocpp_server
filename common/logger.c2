@@ -121,7 +121,7 @@ public func void Log.fatal(Log* log, const char* format, ...) {
 }
 
 func void Log.internal(Log* log, Level level, const char* color_, const char* format, Va_list args) {
-    char[8192] buffer;
+    char[16*1024] buffer;
     char* cp = buffer;
 
     if (log.base.useColor) cp += sprintf(cp, "%s", color_);
