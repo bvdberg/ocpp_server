@@ -3,9 +3,7 @@ executable server
     $warnings no-unused
 #    $warnings no-unused-parameter
 	$generate-c single-module check
-    $refs
     $config DEBUG_HTTP
-#    $deps
     common/file/reader.c2
     common/color.c2
     common/events.c2
