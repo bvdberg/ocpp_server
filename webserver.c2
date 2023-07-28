@@ -2,7 +2,7 @@ module webserver;
 
 import stdlib local;
 import string local;
-#ifdef DEBUG_HTTP
+#if DEBUG_HTTP
 import stdio local;
 import color;
 #endif
@@ -119,7 +119,7 @@ func void Session.destroy(Session* s) {
 
 func void on_http_send(void* arg, const char* data, u32 len) {
     Session* s = cast<Session*>(arg);
-#ifdef DEBUG_HTTP
+#if DEBUG_HTTP
     printf("%s------\n%s\n------%s\n", color.Red, data, color.Normal);
 #endif
     if (s.conn) s.conn.write(data, len);
@@ -167,7 +167,7 @@ func void on_connection_data(void* arg, const char* data, u32 len) {
     if (s.ws_handler) {
         s.ws_handler.on_data(cast<u8*>(data), len);
     } else if (s.http_handler) {
-#ifdef DEBUG_HTTP
+#if DEBUG_HTTP
         printf("%s------\n%s\n------%s\n", color.Green, data, color.Normal);
 #endif
         s.http_handler.parse(data, len);

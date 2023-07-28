@@ -2,14 +2,14 @@
 executable server
     $warnings no-unused
 #    $warnings no-unused-parameter
-	$generate-c single-module check
+	$generate-c
     $config DEBUG_HTTP
     common/file/reader.c2
     common/color.c2
     common/events.c2
-    common/json_builder.c2
-    common/json_data.c2
-    common/json_parser.c2
+    common/json/json_builder.c2
+    common/json/json_data.c2
+    common/json/json_parser.c2
     common/logger.c2
     common/string_buffer.c2
     common/utils.c2
